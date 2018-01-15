@@ -1,2 +1,4 @@
-Same as Nate Schwartz' lutronpro v1.1.0 with the addition of a 5-minute pinger to hold the Lutron Bridge SSL connection open
-(also some diagnostic logging was commented out and/or moved around a bit to hold down the console noise)
+Same as Nate Schwartz' lutronpro v1.1.0 with:
+ v1.1.0.1 wjh added a 5-minute pinger to hold the Lutron Bridge SSL connection open
+              (also some diagnostic logging was commented out and/or moved around a bit to hold down the console noise)
+ v1.1.0.2 wjh cleaned up /status request (refresh request from SmartThings) and added initial level report to SmartThings
