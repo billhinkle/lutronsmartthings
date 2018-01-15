@@ -1,5 +1,6 @@
 // original	1.1.0	nate schwartz
 // rev		1.1.0.1 wjh		added SSL ping every few minutes to hold open the SSL channel
+// rev		1.1.0.2 wjh		cleaned up /status request and added initial level report to SmartThings
 
 var net = require('net');
 var request = require('request');
@@ -93,7 +94,7 @@ function startCodeFetch() {
 
 function callSignIn() {
 	//console.log('Post called');
-	var paramsObject = {utf8: "âœ“", authenticity_token: authenticityToken, 'user[email]': user, 'user[password]': pw, commit: "Sign In"};
+	var paramsObject = {utf8: "✓", authenticity_token: authenticityToken, 'user[email]': user, 'user[password]': pw, commit: "Sign In"};
 	var params = new URLSearchParams(paramsObject).toString();
 	console.log(params);
 	request.post({
@@ -261,7 +262,7 @@ function listenSSL(conn, ip, callback) {
 	var bufferedData = '';
 
 	conn.on('data', function (data) {
-//	   console.log('data in listenSSL');
+// 	   console.log('data in listenSSL');
 	   bufferedData += data;
 		  try {
 			  JSON.parse(bufferedData.toString());
@@ -655,6 +656,33 @@ app.post('/scene', function(req, res) {
 	appSSLClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + req.body.virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n')
 });
 
+app.post('/status', function(req,res) {
+        var deviceID = req.body.deviceID;
+        var deviceZone = req.body.zone;
+
+        console.log('ST status request: Device %d / Zone %d',deviceID,deviceZone);
+
+	// use the zone if available; otherwise reconstruct it from the deviceID, and vice versa
+	if (isConnect) {
+		brix = 0;
+		if (!deviceID) { // if no device ID to use with telnet, reconstruct it from zone
+			var dix = lutronBridges[brix].leapDevices.findIndex(function(tdev) {
+				return (tdev.LocalZones && (tdev.LocalZones[0].href == ('/zone/' + deviceZone)));
+			});
+			if (dix >= 0 && lutronBridges[brix].leapDevices[dix].ID)
+				deviceID = lutronBridges[brix].leapDevices[dix].ID;
+		}
+		if (deviceID) {
+			lutronBridges[brix].telnetClient.write('?OUTPUT,' + deviceID + ',' + '1' + '\r\n');
+			res.sendStatus(202);    // accepted
+			return;
+		} // else no device ID can be determined, fall through to try the non-Pro zone scheme
+	}
+	if (deviceZone)
+		lutronBridges[0].leapRequestZoneLevel(deviceZone);
+	res.sendStatus(202);	// accepted
+});
+
 app.post('/setLevel', function(req, res) {
 	console.log("got an on request");
 	console.log(req.body);
@@ -737,21 +765,52 @@ function Hub(ip) {
 		if (data.toString().indexOf('LIPIdList') !== -1) {
 		  console.log('LIP Data was received and sent to parser');
 		  var jsonData = JSON.parse(data.toString());
+		  var initLip = !self.lipDevices;
+
 		  self.lipDevices = jsonData.Body.LIPIdList;
 		  leapLipParser(self.lipDevices, self.leapDevices, function(data) {
 			console.log("The merged data is:\n" + JSON.stringify(data))
 			self.mergedDevices = data;
 		  });
+
+		  if (initLip)		// don't init telnet connection until all initial bridge requests are returned
+			initTelnet();
 		} else if (data.toString().indexOf('"MultipleDeviceDefinition"') != -1) {
 		  console.log('Leap Data was received and sent to parser');
 		  var jsonData = JSON.parse(data.toString());
+		  var initLeap = !self.leapDevices;
+
 		  self.leapDevices = jsonData.Body.Devices;
+
+		  // attach an initial ID to each device based on its /device/iii property (pro bridge LIP may update it)
+		  for (var j in self.leapDevices) {
+			try {
+			    self.leapDevices[j].ID = Number(self.leapDevices[j].href.replace( /\/device\//i, ''));
+			} catch (e) { }
+		  }
+
+// ??? do we really want to force this update to SmartThings, or expect it to ask first?
+// ???  Maybe only if we know we're connected and SmartThings already knows about our devices?
+		  if (initLeap) {
+			// roll through the device list and send level for anything marked with a zone # to SmartThinghub
+			console.log('Initial levels update request');
+			self.leapDevices.filter(function(brdev){return 'LocalZones' in brdev})
+			                .forEach(function(brdev) {
+				for (var i in brdev.LocalZones) {
+					var devzone = brdev.LocalZones[i].href.replace( /\/zone\//i, '');
+					if (devzone)
+						self.leapRequestZoneLevel(devzone);
+				}
+			});
+		  }
 		  if(self.leapDevices[0].ModelNumber.indexOf('PRO') != -1) {
-	       self.pro = true;
-	       console.log('pro hub');
-	       initTelnet();
-	       }
-	     console.log(self.pro);
+		    self.pro = true;
+		    console.log('pro hub');
+		    // request LIP data from Pro hub, but don't init telnet until it is returned
+		    self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n');
+		  }
+		  else
+		    console.log('std hub');
 		} else if (data.toString().indexOf('MultipleVirtualButtonDefinition')  != -1) {
 			console.log('Scene Data Received');
 			var jsonData = JSON.parse(data.toString());
@@ -769,28 +828,47 @@ function Hub(ip) {
 
 
 		} else {
-			console.log(self.pro);
-			if (!self.pro) {
-				console.log('got the incoming data');
-				console.log(data);
+//			console.log('Pro=%s',self.pro);
+			if (!isConnect) {
 				var jsonData = JSON.parse(data.toString());
-					request({
+
+				// if it's a zone status update, translate to what the SmartApp understands
+				// currently the SmartApp has a bug that skips LEAP-style status update messages :-(
+				// ... so we'll use the 'Telnet' version instead for now
+				if (jsonData.Header.MessageBodyType == 'OneZoneStatus' &&
+				    jsonData.Header.StatusCode == '200 OK') {
+					var rzfld = jsonData.Header.Url.split('\/');
+					if (rzfld[0] == '' && rzfld[1] == 'zone' && rzfld[3] == 'status') {
+						// determine the device ID from the zone's first matching device
+						var dlevel = jsonData.Body.ZoneStatus.Level;
+						var dix = self.leapDevices.findIndex(function(tdev) {
+							return (tdev.LocalZones &&
+								jsonData.Body.ZoneStatus.Zone &&
+								(tdev.LocalZones[0].href == jsonData.Body.ZoneStatus.Zone.href));
+						});
+						if (dix > 0 && self.leapDevices[dix].ID) {
+							jsonData = {device: self.leapDevices[dix].ID, level: dlevel};
+						}	// else no device with a matching zone, just fall through
+					}
+				} // otherwise just send it along as-is and let the SmartApp deal with it!
+
+				request({
 						url: 'http://' + SMARTTHINGS_IP + ':39500',
 						method: "POST",
 						json: true,
 						body: jsonData
 					}, function (error, response, body){
+						if (error)
+							throw(error);
 					}); 
 			}
 		}
 	}
-	
+
 	function initTelnet() {
 		console.log("starting telnet connection")
 		self.telnetClient = new net.Socket();
-		//listenSSL(self.sslClient, self.ip, handleIncomingSSLData);
 		appTelnetClient = self.telnetClient;
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n');
 		telnetHandler(self.telnetClient, self.ip, handleIncomingTelnetData);
 	}
 	
@@ -804,6 +882,9 @@ function Hub(ip) {
 			}, function (error, response, body){
 		});
 	}
+}
+Hub.prototype.leapRequestZoneLevel = function (deviceZone) {
+        this.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/zone/' + deviceZone + '/status"}}\n');
 }
 
 exports.startup = function(SB_IP, ST_IP, USER, PW, bMethods, spTime, intTime) {
