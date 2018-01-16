@@ -1,69 +1,155 @@
-// original	1.1.0	nate schwartz
-// rev		1.1.0.1 wjh		added SSL ping every few minutes to hold open the SSL channel
-// rev		1.1.0.2 wjh		cleaned up /status request and added initial level report to SmartThings
+// v 1.1.0  original master	nate schwartz
+// v 2018.01.03 13:00UTC	wjh
+//	cleaned up some SmartThings comm, added self-identifying ST IP support
+//	overrode express error handler transmission so SmartThings hub only sees a 500 Server Error now, not stack trace
+//	dynamically select first free port from 5000 for SmartThings requests
+//	modified ssdp advertisement:
+//		start ssdp advertisement only after everything else initialized
+//		advertises dynamically selected port (5000+),
+//		advertises device-unique USN (uuid),
+//		location is /connect 'til 1st ST get/post, then /status so ST hub sees our restart & maybe IP/port change
+//
+//	added handling of multi-line telnet bursts (as in reply to scene requests via telnet)
+//	added attempt to gracefully logout the bridge's telnet at shutdown or comm retry
+//	restored  ST status/refresh checking for LC Pro bridge via telnet
+//	restored  ST scene triggering for LC Pro bridge via telnet
+//	modified SmartThings command responses to handle via Telnet if available, else SSL
+//	added auto resume for tls/SSL connection to LC bridges, removed SSH references
+//	added auto reconnect for tls/SSL and telnet connection to LC bridges on expected reply timeout & comm errors
+//	added 1-minute ping watchdog to monitor LC bridge connection (via SSL or Telnet for Pro)
+//	      ping watchdog is defered when expecting a status response, since the (Telnet) ping response may corrupt it
+//	added support for multiple pico button press/held/ramp events in play simultaneously (can the LC bridge do that?)
+//	added pseudo-release for pico buttons after timeout (buttons 1,2,3 won't release after ~6 sec)
+//	added (partial!) support for PJ2-4B Pico (4-buttons: codes 8,9,10,11)... need more config info!
+//	modified LIP-to-LEAP device matching to also require Area match if Area is defined in LIP data (w/ Name)
+//	clarified some nomenclature, method, function and variable names, refactored some calling schemas
+'use strict';
 
-var net = require('net');
-var request = require('request');
-var express = require('express');
-var bodyParser  = require('body-parser');
-var sshClient = require('ssh2').Client;
-var tls = require('tls');
-var Server = require('node-ssdp').Server;
-var ip = require('ip');
-var fs = require('fs');
-var cmd = require('node-cmd');
-var CronJob = require('cron').CronJob;
-var forge = require('node-forge');
-var URLSearchParams = require('url-search-params');
+const assert = require('assert');
+const net = require('net');
+const getport = require('getport');
+const request = require('request');
+const express = require('express');
+const bodyParser  = require('body-parser');
+const tls = require('tls');
+const ssdpServer = require('node-ssdp').Server;
+const uuidv1 = require('uuid/v1');
+const ip = require('ip');
+const ipaddr = require('ipaddr.js');
+const mDNSHandler = require('bonjour')();
+const eventEmitter = require('events');
+const fs = require('fs');
+// var cmd = require('node-cmd');
+// var CronJob = require('cron').CronJob;
+const forge = require('node-forge');
+const URLSearchParams = require('url-search-params');
 
-var accessToken;
-var smartbridgeIP;
-var jsonKey;
-var client;
-var appCert;
-var localCert;
-var haveCerts = false;
-var callback;
-var authenticityToken;
-var cookie;
+// #ifdef TelnetDebug
+// for telnet debug, type @something at the console and it will be relayed to the Telnet interface, if connected
+const readline = require('readline');
+const telnetConsoleRL = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  // prompt: 'PRO> '
+});
+telnetConsoleRL.on('SIGINT', function () {
+  process.emit('SIGINT');
+});
+// #endif
 
 const CLIENT_ID = "e001a4471eb6152b7b3f35e549905fd8589dfcf57eb680b6fb37f20878c28e5a";
 const CLIENT_SECRET = "b07fee362538d6df3b129dc3026a72d27e1005a3d1e5839eed5ed18c63a89b27";
 const REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob";
 
-var appTelnetClient;
-var appSSLClient;
-var app = express();
+const app = express();
 app.use(bodyParser.json());
-var isConnect = false;
 
 var exports = module.exports = {};
 
-var lutronBridges = [];
+var overrideNoPro = false;	// command-line flag to ignore Pro-ness of the bridge(s)
+
+var lutronBridge = [];		// per-bridge objects array
+var lutronBridgeSN = {};	// SN-to-bridge index lookup
+var lutronBridgeEvents = new eventEmitter();
+const LBE_GOTDEVICES = 'gotdevices';
+const LBE_GOTSCENES = 'gotscenes';
+
+const communiqueBridgePingRequest    = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/status/ping"}}\n';
+const communiqueBridgeDevicesRequest = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n';
+const communiqueBridgeScenesRequest  = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n';
+const communiqueBridgeLIPDevicesRequest  = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n';
+
+const LCB_RESPONSE_TIMEOUT = 3000;
+const LCB_RECONNECT_DELAY = 7500;
+const LCB_PING_INTERVAL = 90000;
+
+const DEFAULT_REQST_PORT = 5000;
+const STLAN_PORT = 39500;	// this could be (re-)set dynammically upon ST IP acquistion via /connect
+
+// ????? temporary mac handler
+var sb_mac = [];
+
 var SMARTBRIDGE_IP;
 var SMARTTHINGS_IP;
-var buttonMethods;
-var shortPressTime;
-var intervalTime;
-var keys;
-var code;
-var user;
-var pw;
+var stReqPort = DEFAULT_REQST_PORT;
+var stReqServer = null;
+var ssdp = null;
 
-function initalize(ip, cb) {
-	smartbridgeIP = ip;
-	callback = cb;
-	
+var picoButtonMethods = [];
+var picoHeldTimeout = 6050; //milliseconds
+var picoShortPressTime;
+var picoIntervalTime;
+var picoActive = {};		// list object of active picos keyed by pico ID
+var picoEvents = new eventEmitter();
+
+const BUTTON_OP_PRESS = 3;
+const BUTTON_OP_RELEASE = 4;
+const BUTTON_FORCE_RELEASE = true;
+
+const LIP_CMD_OUTPUT_REQ = 1;
+const LIP_CMD_OUTPUT_SET = 1;
+const LIP_CMD_OUTPUT_RAISE = 2;
+const LIP_CMD_OUTPUT_LOWER = 3;
+const LIP_CMD_OUTPUT_STOP = 4;
+
+function authFileIndexExtension(authIndex,authFileName) {
+	function zpad(num, size){ return ('000' + num).substr(-size)};
+	return authFileName + '.' + zpad(authIndex,3);
+}
+
+function lutronAuthenticate(user,pw,authCallback) {	// callback param=authentication index if ok, undefined
+// only one authenticated Lutron bridge is permitted per account
+	var authIndex = 0;
+	var accessToken;
+	var jsonKey;
+	var client;
+	var appCert;
+	var localCert;
+	var authenticityToken;
+	var cookie;
+	var keys;
+	var code;
+	var haveCerts = false;
+
+	var self = this;
+
+var _Authenticate =  function() {
+
 	fs.stat('appCert', function(err, stats) {
 		if (!err) {
 			console.log('appCert exists! YEAH!!');
 			haveCerts = true;
-			callback();
+			authCallback(authIndex);
 		} else {
-			console.log('No certs will attempt to generate them')
-
+			console.log('No certs will attempt to generate them');
+			console.log('Key generation may take a while...');
 			forge.pki.rsa.generateKeyPair(2048, function(error, keypair) {
-			   console.log('keys callback');
+//			   console.log('keys callback');
+			   if (error) {
+			      console.error('There was an error generating the keys!', error);
+			      authCallback();
+			      return;
+			   };
 			   var pem = forge.pki.privateKeyToPem(keypair.privateKey);
 			   console.log(pem);
 			   fs.writeFileSync("privateKey", pem);
@@ -71,18 +157,23 @@ function initalize(ip, cb) {
 			   //getCSR();
 			   startCodeFetch()
 			});
-			
+
 		}
-		
 	});
-}
+} ();
 
 function startCodeFetch() {
+
 	request.get({
 		  headers: {'content-type' : 'application/x-www-form-urlencoded'},
 		  followAllRedirects: false,
-		  url:     'https://device-login.lutron.com/users/sign_in',
+		  url:     'https:\/\/device-login.lutron.com/users/sign_in',
 		}, function(error, response, body){
+		  if (error) {
+		    console.error('There was an error accessing sign_in!', error);
+		    authCallback();
+		    return;
+		  };
 		  var s = body.indexOf('name="authenticity_token" value="');
 		  authenticityToken = body.substr(s + 33, 100).split('"')[0].trim();
 		  cookie = response.headers['set-cookie'][0].trim();
@@ -93,15 +184,20 @@ function startCodeFetch() {
 
 
 function callSignIn() {
-	//console.log('Post called');
+
 	var paramsObject = {utf8: "✓", authenticity_token: authenticityToken, 'user[email]': user, 'user[password]': pw, commit: "Sign In"};
 	var params = new URLSearchParams(paramsObject).toString();
 	console.log(params);
 	request.post({
 		headers: {'content-type' : 'application/x-www-form-urlencoded', 'Cookie': cookie},
-		url:     'https://device-login.lutron.com/users/sign_in?' + params,                 
+		url:     'https:\/\/device-login.lutron.com/users/sign_in?' + params,
 		body: "",
 		}, function(error, response, body) {
+			if (error) {
+			  console.error('There was an error getting the token!', error);
+			  authCallback();
+			  return;
+			};
 			cookie = response.headers['set-cookie'][0].trim();
 			console.log(authenticityToken);
 			getCode();
@@ -109,17 +205,25 @@ function callSignIn() {
 }
 
 function getCode() {
-	console.log('Get called');
+
+	console.log('getCode called');
 	request.get({
 		headers: {'Cookie' : cookie},
-		url:     'https://device-login.lutron.com/oauth/authorize?redirect_uri=' + encodeURI(REDIRECT_URI) + '&client_id=' + encodeURI(CLIENT_ID) +  '&response_type=code',
+		url:     'https:\/\/device-login.lutron.com/oauth/authorize?redirect_uri=' + encodeURI(REDIRECT_URI) + '&client_id=' + encodeURI(CLIENT_ID) +  '&response_type=code',
 		followAllRedirects: true,
 		}, function(error, response, body) {
+			  if (error) {
+			    console.error('There was an error getting the code!', error);
+			    authCallback();
+			    return;
+			  };
 			  console.log(authenticityToken);
 			  var s = body.indexOf('authorization_code');
 			  console.log(s);
-			  if(s == -1) {
-				  console.log('no code, try again');
+			  if (s == -1) {
+				console.log('no code, try again');
+				console.error('Failed to authorize user ',user);
+				authCallback();
 			  } else {
 				code = body.substr(s + 20, 80).split('<')[0];
 				console.log('the code is ' + code);
@@ -131,6 +235,7 @@ function getCode() {
 }
 
 function getCSR() {
+
 	console.log('in get CSR')
 	var csr = forge.pki.createCertificationRequest();
 
@@ -157,20 +262,20 @@ function getCSR() {
 
 	// here we set subject and issuer as the same one
 	csr.setSubject(attrs);
-		
+
 	// the actual certificate signing
 	csr.sign(keys.privateKey);
-    console.log(csr);
+	console.log(csr);
 	var verified = csr.verify();
 	// now convert the Forge certificate to PEM format
 	var pem = forge.pki.certificationRequestToPem(csr);
 	console.log(pem);
-	
+
 	var strippedPem = pem.replace(/\r/g, "");
 	jsonKey = {"remote_signs_app_certificate_signing_request" : strippedPem};
 	console.log(JSON.stringify(jsonKey));
 	getAccessToken();
-	
+
 	/*
 	cmd.get(
 		'openssl req -new -key private.pem -out my-csr.pem -subj "/C=US/ST=Pennsylvania/L=Coopersburg/O=Lutron Electronics Co., Inc./CN=Lutron Caseta App"',
@@ -184,6 +289,8 @@ function getCSR() {
 }
 
 function getAccessToken() {
+	var authCallback = cb;
+
 	console.log('in get token');
 	console.log('the code is ' + code);
 	var paramsObject = {redirect_uri: REDIRECT_URI, 'client_id': CLIENT_ID, client_secret : CLIENT_SECRET, 'code': code, 'grant_type': 'authorization_code'};
@@ -191,9 +298,14 @@ function getAccessToken() {
 
 	request.post({
 	  headers: {'content-type' : 'application/x-www-form-urlencoded', 'Cookie' : cookie},
-	  url:     'https://device-login.lutron.com/oauth/token',
+	  url:     'https:\/\/device-login.lutron.com/oauth/token',
 	  body:    params, //"code=" + code + "&client_id=e001a4471eb6152b7b3f35e549905fd8589dfcf57eb680b6fb37f20878c28e5a&client_secret=b07fee362538d6df3b129dc3026a72d27e1005a3d1e5839eed5ed18c63a89b27&redirect_uri=https%3A%2F%2Fdevice-login.lutron.com%2Flutron_app_oauth_redirect&grant_type=authorization_code"
 	}, function(error, response, body){
+	  if (error) {
+	    console.error('There was an error obtaining the access token!', error);
+	    authCallback();
+	    return;
+	  };
 	  var jsonObject = JSON.parse(body);
 	  accessToken = jsonObject.access_token;
 	  console.log(accessToken);
@@ -203,12 +315,18 @@ function getAccessToken() {
 }
 
 function getCerts() {
+
 	console.log('in get certs');
 	request.post({
 	  headers: {'content-type' : 'application/json', 'X-DeviceType' : 'Caseta,RA2Select', 'Authorization' : 'Bearer ' + accessToken},
-	  url:     'https://device-login.lutron.com/api/v1/remotepairing/application/user',
+	  url:     'https:\/\/device-login.lutron.com/api/v1/remotepairing/application/user',
 	  body:    JSON.stringify(jsonKey)
 	}, function(error, response, body){
+	  if (error) {
+	    console.error('There was an error generating the certificates!', error);
+	    authCallback();
+	    return;
+	  };
 	  var jsonObject = JSON.parse(body);
 	  appCert = jsonObject.remote_signs_app_certificate;
 	  localCert = jsonObject.local_signs_remote_certificate;
@@ -218,688 +336,1063 @@ function getCerts() {
 	  fs.writeFileSync("localCert", JSON.stringify(localCert));
 	  /*
 	  fs.writeFileSync("appCert", JSON.stringify(appCert), function(err) {  //SON.stringify(appCert, null, 2)
-		if(err) {
+		if (err) {
           return console.log(err);
 		}
 	  });
 	  fs.writeFile("localCert", JSON.stringify(localCert), function(err) {
-		if(err) {
+		if (err) {
 		  return console.log(err);
 		}
 	  });
 	  */
 	  haveCerts = true;
-	  callback();
+	  authCallback(authIndex);
 	});
 }
+}
 
+function parseLip2Leap(lipData, leapData) {
+	var lipComplete = [];
+	//Make the Devices and Zones objects a single array
+	for (var i = 0; i < lipData.Devices.length; i++) {
+		lipComplete.push(lipData.Devices[i]);
+	}
+	if (lipData.Zones) {
+		for (var i = 0; i < lipData.Zones.length; i++) {
+			lipComplete.push(lipData.Zones[i]);
+		}
+	}
+	var idMismatches = 0;
+	//Add the LIP ID to the LEAP data, matching by device name and area, if available
+	for (var i in lipComplete) {
+		console.log("Matching LIP: ",lipComplete[i].Name);
+		for (var j in leapData) {
+//			console.log(leapData[j].Name);
+			if (lipComplete[i].Name == leapData[j].Name &&
+			    (lipComplete[i].Area === undefined ||
+			     (leapData[j].FullyQualifiedName.length > 1 &&
+			      lipComplete[i].Area.Name == leapData[j].FullyQualifiedName[0]))) {
 
+				console.log("Matched LEAP name to LIP ID: ",lipComplete[i].ID);
+				leapData[j]["ID"] = lipComplete[i].ID;
+				if (leapData[j]["ID"] != parseInt(leapData[j].href.substring(8))) { // '/device/xxx'
+					console.log("Device %s ID mismatch",leapData[j].Name);
+					idMismatches++;
+				}
+			}
+		}
+//		console.log(leapData);
+	}
+	//Check if there is a discrepancy between LEAP and LIP ID's and notify the user if there is
+	if (idMismatches)
+		console.log("%d device ID(s) for LEAP and LIP servers do not match! This might cause problems for you.",idMismatches);
+}
 
+function telnetHandler(lcbridgeself, stcallback) {
+	var lcBridge = lcbridgeself;
+	var lcbridgeix = lcBridge.bridgeix;
+	var telnetClient = lcBridge.telnetClient;
 
-//SSDP server for Service Discovery
-ssdp = new Server({
-    sourcePort: 1900,
-	location: 'http://' + ip.address() + ':5000/status',
+	telnetClient.on('data', function(data) {
+	  var msgline;
+	  var message;
+
+//	  console.log('Telnet #%d received: %s', lcbridgeix, data);
+	  // we have to account for GNET> prompts embedded within responses, and multiple-line responses
+	  message = data.toString();
+	  if (message.indexOf('GNET>') !== -1) {	// a prompt, but it might've been embedded so reprocess line also
+	    if (!lcBridge.telnetIsConnect) {	// first prompt upon connection
+	      telnetConnectConfirmed();
+	    } else { // likely a ping, note that we did get a ping response
+	      // currently taking a GNET> prompt as a ping response, but we COULD instead send
+	      // ?SYSTEM,10 and get back  ~SYSTEM,12/28/2017,14:40:06  e.g.
+	      lcBridge.expectResponse(-1);
+	      lcBridge.expectPingback = false;
+	      lcBridge.flipPingTag = !lcBridge.flipPingTag;
+	      process.stdout.write('Pinged #'+lcbridgeix+' '+(lcBridge.flipPingTag?'T':'t')+'\r');
+	    }
+	    // now remove the prompt(s) and continue processing the data
+	    message = message.replace(/GNET\>\s/g, '');
+	  }
+	  msgline = message.match(/^.*((\r\n|\n|\r|\s)|$)/gm);	// break up multiple & concatenated lines
+
+	 for (var i = 0, mlcnt = msgline.length; i < mlcnt; i++) {
+	  if (msgline[i].length)
+		  console.log('Telnet #%d received: %s', lcbridgeix, msgline[i]);
+	  if (msgline[i].indexOf('login') !== -1) {
+		telnetClient.write('lutron\r\n');
+	  } else if (msgline[i].indexOf('password') !== -1) {
+		telnetClient.write('integration\r\n');
+	  } else if (msgline[i].indexOf('~OUTPUT') !== -1) {	// dimmer/switch level report
+		console.log('Device update received');
+		if (lcBridge.expectResponse()) {
+			lcBridge.expectResponse(-1); // we've received a response
+		} else {	// we weren't expecting anything, must be...
+			console.log('Looks like a manual/Lutron app change');
+		}
+		message = msgline[i].split(',');
+		var zoneLevel = message[3].split('.')[0];
+		var myJSONObject = {bridge: lcBridge.bridgeSN, device: message[1], level: zoneLevel};
+		stcallback(myJSONObject);
+		return;
+	  } else if (msgline[i].indexOf('~DEVICE') !== -1) {	// Pico or scene status update
+
+		message = msgline[i].split(',');
+		var picoDevice = message[1];
+		var picoButtonCode = message[2];
+		var picoButtonOp = message[3];
+		var picoButtonForceRelease;
+		var buttonconfigix;
+		var buttonconfig;
+
+		console.log("Bridge=%d, Device=%d, ButtonCode=%d",lcbridgeix,picoDevice,picoButtonCode);
+//		console.log("Button configs:\r\n",picoButtonMethods);
+// ??? this bridge indexing isn't good in the long run because the order of bridges might change vs. button methods table
+		picoButtonForceRelease = BUTTON_FORCE_RELEASE;
+		if (picoDevice == 1) {
+			console.log("Virtual button");
+			buttonconfig = -1;
+		}
+		else {
+			buttonconfig = picoButtonMethods[lcbridgeix].findIndex(function(i) {
+				return (i.device == picoDevice);
+			});
+			if (buttonconfig >= 0)
+				console.log("Use button config[%d]",buttonconfig);
+			else
+				console.log("No button config");
+			//Fix the button mappings & determine whether we can rely on a release message
+			switch (picoButtonCode) {
+			   case "2":	buttonconfigix = 1;
+						break;
+			   case "3":	buttonconfigix = 3;
+						break;
+			   case "4":	buttonconfigix = 2;
+						break;
+			   case "5":	buttonconfigix = 4;
+					picoButtonForceRelease = false;
+						break;
+			   case "6":	buttonconfigix = 5;
+					picoButtonForceRelease = false;
+						break;
+			   case "8":	buttonconfigix = 1;	// pico PJ2-4B
+						break;
+			   case "9":	buttonconfigix = 2;	// pico PJ2-4B
+						break;
+			   case "10":	buttonconfigix = 3;	// pico PJ2-4B
+						break;
+			   case "11":	buttonconfigix = 4;	// pico PJ2-4B
+						break;
+			   default: 	buttonconfigix = 0;
+						break;
+			}
+		}
+		//console.log(picoButtonMethods[match][button]);
+		picoHandler(picoDevice,
+		            picoButtonCode,
+		            picoButtonForceRelease,
+		            (buttonconfig >= 0 && picoButtonMethods[lcbridgeix][buttonconfig][buttonconfigix]), //ramp hold
+                            picoButtonOp);
+		// console.log("%s active Pico buttons",Object.keys(picoActive).length);
+
+		function picoID(lcbridgeix,picoDevice,picoButtonCode) {
+			return lcbridgeix+":"+picoDevice+":"+picoButtonCode;
+		}
+
+		// object representing an active Pico (or virtual button for scene)
+		function PicoActive(picoBridgeix,picoDevice,picoButtonCode,picoButtonForceRelease) {
+			this._picoID = picoID(picoBridgeix,picoDevice,picoButtonCode);
+			this._lcbridgeix = picoBridgeix;
+			this._picoDevice = picoDevice;
+			this._picoButtonCode = picoButtonCode;
+			this._picoButtonForceRelease = picoButtonForceRelease;
+
+			this.timerHeld;
+			this.timerRelease;
+			this.intervalRamp;
+			this.wasRamped;
+
+			var startTime;
+			this.Init = function () {
+				startTime = new Date().getTime();
+				this.wasramped = false;
+			}
+			this.Init ();
+
+			this.elapsed = function () {
+				return (startTime)? (new Date().getTime() - startTime) : 0; 
+			}
+		}
+		PicoActive.prototype.quash = function () {
+			if (this.timerHeld) {
+				clearTimeout(this.timerHeld);
+				this.timerHeld = null;
+			}
+			if (this.timerRelease) {
+				clearTimeout(this.timerRelease);
+				this.timerRelease = null;
+			}
+			if (this.intervalRamp) {
+				clearInterval(this.intervalRamp);
+				this.intervalRamp = null;
+			}
+			picoEvents.removeAllListeners(this._picoID);
+		}
+		PicoActive.prototype.restart = function () {
+			this.quash();
+			this.Init();
+		}
+
+		function picoReportJSONObject(picoAction,picoOpName) {
+			return {bridge: lutronBridge[picoAction._lcbridgeix].bridgeSN,
+                                device: picoAction._picoDevice,
+                                button: picoAction._picoButtonCode,
+                                action: picoOpName };
+		}
+
+		function picoHandler(picoDevice,picoButtonCode,picoButtonForceRelease,picoRampHold,picoButtonOp) {
+			var myPicoID = picoID(lcbridgeix,picoDevice,picoButtonCode);
+
+			console.log(picoRampHold?"ramp hold button":"long hold button");
+
+			if (picoButtonOp == BUTTON_OP_PRESS) {  // pressed
+			  var curPicoActive;
+			  // see if the corresponding button operation object already exists;
+			  //     if so, this must be repeated presses without intervening release (re-connect, maybe?)
+			  if (picoActive[myPicoID]) {	//reuse the existing object for this pico button
+				curPicoActive = picoActive[myPicoID];
+				curPicoActive.restart();
+			  } else {	// instantiate a new object for this pico button
+				picoActive[myPicoID] = new PicoActive(lcbridgeix,picoDevice,picoButtonCode,picoButtonForceRelease);
+				curPicoActive = picoActive[myPicoID];
+			  }
+			  // listen for a release event on this button; note that an event is created per-button
+			  picoEvents.on(myPicoID, function(picoNextID,picoButtonNextOp,forcedrelease) {
+				if (picoButtonNextOp == BUTTON_OP_RELEASE) {	// released 
+				  var nextPicoActive = picoActive[picoNextID];
+				  nextPicoActive.quash();
+				  var elapsed = nextPicoActive.elapsed();
+				  console.log("%s button was %sreleased in %d ms",picoNextID,(forcedrelease)?"force-":"",elapsed);
+				  if (!nextPicoActive.wasRamped) {
+					var myJSONObject = picoReportJSONObject(nextPicoActive,
+                                                               (elapsed < picoShortPressTime)?"pushed":"held");
+					stcallback(myJSONObject);
+					return;
+				  }
+				  // kill off this pico button's objects after release (temp & global)
+				  nextPicoActive = undefined;
+				  delete picoActive[picoNextID];
+				} else
+				  console.log("unexpected pico event: %s %d",picoNextID,picoButtonNextOp);
+			  });
+			  if (curPicoActive._picoButtonForceRelease) {
+				// if req'dm prepare to force a button release after a specified timeout
+				curPicoActive.timerRelease = setTimeout(function() {
+					// can't count on a button release message, so simulate one
+					picoEvents.emit(this._picoID,this._picoID,BUTTON_OP_RELEASE,true);
+				}.bind(curPicoActive), picoHeldTimeout);
+			  }
+			  if (picoRampHold) {	// ramp hold: start repeating held beyond 'short' press time
+				curPicoActive.timerHeld = setTimeout(function() {
+					console.log("short-press timeout");
+					this.intervalRamp = setInterval(function() {
+						this.wasRamped = true;
+						console.log("ramp interval")
+						var myJSONObject = picoReportJSONObject(this,"held");
+						stcallback(myJSONObject);
+						return;
+					}.bind(this), picoIntervalTime);
+				  }.bind(curPicoActive), picoShortPressTime);
+			  } // else long hold, just wait for a real (or forced) release
+			} else if (picoButtonOp == BUTTON_OP_RELEASE) {	// released
+				picoEvents.emit(myPicoID,myPicoID,picoButtonOp,false);
+			}
+		}
+	  }
+	 }
+	});
+
+	telnetClient.on('error', function errorHandlerTelnet(err) {
+		console.log('Pro Bridge # %d telnet comm error %s %s',lcbridgeix,err.code,err);
+		if (err.code === 'ETIMEDOUT' || err.code === 'EHOSTUNREACH' || err.code === 'EPIPE') {
+			// ... back off and retry connection
+			lcBridge.reconnect(true, LCB_RECONNECT_DELAY);
+			return;
+		}
+		else if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
+			// ... back off and restart connection from scratch
+			lcBridge.reconnect(false, 2 * LCB_RECONNECT_DELAY);
+			return
+		}
+		else if (err.code !== undefined) { // likely not an SSL error
+			throw(err);
+		 	return;
+		}
+		// geez who knows?? give up
+		throw(err);
+	});
+
+	telnetClient.on('close', function() {
+		lcBridge.telnetIsConnect = false;
+		console.log('Disconnected telnet from Pro Bridge #%d',lcbridgeix)
+		if (lcBridge.sslClient && !lcBridge.sslClient.destroyed) {
+		  // hand the pinging duties back to the SSL connection
+		  lcBridge.setPingSSL();
+		}
+	});
+
+	telnetClient.on('connect', function() {
+		console.log('Connected via telnet to Pro Bridge #%d',lcbridgeix);
+		// however, we aren't functionally connected until the first GNET> prompt
+	});
+
+	telnetClient.connect(23, lcBridge.ip, function() {
+	});
+
+	telnetClient.setKeepAlive(true,2000);	// additionally, we'll ping once in a while to ensure re-connect
+
+	function telnetConnectConfirmed () {
+		  lcBridge.telnetIsConnect = true;
+		  console.log('Telnet #%d Connected!',lcbridgeix)
+
+		  // change the ping scheme to use Telnet instead of SSL for the Pro bridge
+		  if (lcBridge.intervalPing)
+			clearInterval(lcBridge.intervalPing);
+		  lcBridge.expectPingback = false;
+		  lcBridge.intervalPing = setInterval(function() {
+		    if (lcBridge.telnetIsConnect && !lcBridge.expectPingback && !lcBridge.expectResponse()) {
+//		      console.log("Ping #%d",lcbridgeix);
+		      process.stdout.write('                        \rPing #'+lcbridgeix+'... ');
+		      lcBridge.expectResponse(1);
+		      lcBridge.expectPingback = true;
+		      telnetClient.write('\r\n');
+		      // expected reply:
+		      // GNET>
+		    }
+		    // else     we didn't get a ping response! OR avoid stepping on expected status response w/ping
+		    // defer further pings and wait out the socket timeout or other comm error that should ensue
+		  }, LCB_PING_INTERVAL);
+
+		  // #ifdef TelnetDebug
+		  // Telnet debug console: any line that starts with @ gets sent to Telnet
+		  telnetConsoleRL.on('line', (line) => {
+		    line = line.trim();
+		    if (line.charAt(0) == '@') {
+		      line = line.slice(1) + '\r\n';
+		      telnetClient.write(line);
+		    }
+		    // rl.prompt();
+		  });
+		  // #endif
+	}
+}
+
+app.post('/connect', function(req,res) {	// ST hub can post here to 'claim' this shim and inform of its IP
+	SMARTTHINGS_IP = req.ip;
+	res.sendStatus(200);
 });
- 
-    ssdp.addUSN('urn:schemas-upnp-org:device:RPi_Lutron_Caseta:1');
- 
-    ssdp.on('advertise-alive', function (headers) {
-    });
- 
-    ssdp.on('advertise-bye', function (headers) {
-    });
-    // start the server 
 
-    process.on('exit', function(){
-      ssdp.stop() // advertise shutting down and stop listening 
-    })
+app.post('/status', function(req,res) {
+	var lcbridgeix = parseRequestBridgeIX(req.body);
+	if (lcbridgeix < 0) {
+		res.sendStatus(404);	// we don't know this particular bridge
+		return;
+	}
+	var reqbridge = lutronBridge[lcbridgeix];
 
-var testData1 = '{"CommuniqueType":"ReadResponse","Header":'
-var testData2 = '{"MessageBodyType":"OneLIPIdListDefinition","StatusCode":"200 OK","Url":"/server/2/id"},"Body":{"LIPIdList":{"Devices":[{"Name":"Smart Bridge","ID":1,"Buttons":[{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1}]},{"Name":"Pico Test","ID":3,"Buttons":[{"Number":2},{"Number":3},{"Number":4},{"Number":5},{"Number":6}]}],"Zones":[{"Name":"Office","ID":2}]}}}'
+  SMARTTHINGS_IP = req.ip;
 
-function listenSSL(conn, ip, callback) {
-	var bufferedData = '';
+	var deviceID = req.body.deviceID;
+	var deviceZone = req.body.zone;
+        console.log('ST status request: Bridge %s, Device %d / Zone %d', lcbridgeix,deviceID,deviceZone);
 
-	conn.on('data', function (data) {
-// 	   console.log('data in listenSSL');
-	   bufferedData += data;
-		  try {
+/* ????? temporary removal for testing zone level requests
+	if (reqbridge.telnetIsConnect) {
+		// ST SmartApp may only send zone instead of both zone/device ID, for status inquiry, even for Pro bridge
+		if (!deviceID) { // if no device ID, get it from the zone 
+			var deviceix = reqbridge.leapDevices.findIndex(function(devinfo) {
+				return (devinfo.LocalZones && (devinfo.LocalZones[0].href == ('/zone/' + deviceZone)));
+			});
+			if (deviceix >= 0 && reqbridge.leapDevices[deviceix].ID)
+				deviceID = reqbridge.leapDevices[deviceix].ID;
+		}
+		if (deviceID) {
+			reqbridge.telnetClient.write('?OUTPUT,' + deviceID + ',' + LIP_CMD_OUTPUT_REQ + '\r\n');
+			reqbridge.expectResponse(1);
+			res.sendStatus(202);	// accepted
+			return;
+		}	// else no device ID can be determined, fall through to use the non-Pro zone scheme
+	}
+*/
+/*
+	reqbridge.writeSSL('{"CommuniqueType":"ReadRequest","Header":{"Url":"/zone/' + deviceZone + '/status"}}\n');
+	reqbridge.expectResponse(1);
+	res.sendStatus(202);	// accepted
+*/
+	if (deviceZone)
+		reqbridge.leapRequestZoneLevel(deviceZone);
+	res.sendStatus(202);	// accepted
+});
+
+app.get('/devices', function(req, res) {
+  SMARTTHINGS_IP = req.ip; 
+	console.log("ST device list request");
+
+	var gdbridgeok = [];
+	for (var i in lutronBridge) {	// get devices for all known bridges
+		lutronBridge[i].writeSSL(communiqueBridgeDevicesRequest);
+		lutronBridge[i].expectResponse(1);
+		gdbridgeok[i] = false;
+	}
+	var gdbridgecnt = lutronBridge.length;
+	if (!gdbridgecnt) {
+		res.sendStatus(404);	// we don't know any bridges
+		return;
+	}
+
+	lutronBridgeEvents.on(LBE_GOTDEVICES, function lbeReqGotDevices(gdbridgeix) {
+		if (!gdbridgeok[gdbridgeix]) {
+			gdbridgeok[gdbridgeix] = true;
+			gdbridgecnt--;
+		}
+		if (!gdbridgecnt) {
+			var combinedDevicesList = [];
+			for (var i in lutronBridge) {	// for all known bridges
+				console.log('%s Bridge #%d device data',lutronBridge[i].pro?'Pro':'Std',i);
+				combinedDevicesList = combinedDevicesList.concat(lutronBridge[i].leapDevices);
+			}
+			res.setHeader('Content-Type', 'application/json');
+			res.send(combinedDevicesList);
+
+			lutronBridgeEvents.removeListener(LBE_GOTDEVICES, lbeReqGotDevices);
+		}
+	});
+});
+
+app.get('/scenes', function(req, res) {
+  SMARTTHINGS_IP = req.ip;
+	console.log("ST scenes list request");
+
+	var gsbridgeok = [];
+	for (var i in lutronBridge) {	// for all known bridges
+		lutronBridge[i].writeSSL(communiqueBridgeScenesRequest);
+		lutronBridge[i].expectResponse(1);
+		gsbridgeok[i] = false;
+	}
+	var gsbridgecnt = lutronBridge.length;
+	if (!gsbridgecnt) {
+		res.sendStatus(404);	// we don't know any bridges
+		return;
+	}
+	lutronBridgeEvents.on(LBE_GOTSCENES, function lbeReqGotScenes(gsbridgeix) {
+		if (!gsbridgeok[gsbridgeix]) {
+			gsbridgeok[gsbridgeix] = true;
+			gsbridgecnt--;
+		}
+		if (!gsbridgecnt) {
+			var combinedScenesList = [];
+			for (var i in lutronBridge) {	// for all known bridges
+				console.log('Bridge #%d scene data',i);
+				combinedScenesList = combinedScenesList.concat(lutronBridge[i].scenesList);
+			}
+			res.setHeader('Content-Type', 'application/json');
+			res.send(combinedScenesList);
+
+			lutronBridgeEvents.removeListener(LBE_GOTSCENES, lbeReqGotScenes);
+		}
+	});
+});
+
+app.post('/scene', function(req, res) {
+	var lcbridgeix = parseRequestBridgeIX(req.body);
+	if (lcbridgeix < 0) {
+		res.sendStatus(404);	// we don't know this particular bridge
+		return;
+	}
+	var reqbridge = lutronBridge[lcbridgeix];
+
+  SMARTTHINGS_IP = req.ip;
+	console.log("ST bridge %d scene request %j",lcbridgeix,req.body);
+
+	if (reqbridge.telnetIsConnect) {
+		reqbridge.telnetClient.write('#DEVICE,1,' + req.body.virtualButton + ',' + BUTTON_OP_PRESS + '\r\n');
+		reqbridge.telnetClient.write('#DEVICE,1,' + req.body.virtualButton + ',' + BUTTON_OP_RELEASE + '\r\n');
+		reqbridge.expectResponse(2);
+	} else {
+		reqbridge.writeSSL('{"CommuniqueType": "CreateRequest","Header": {"Url":"/virtualbutton/' + req.body.virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n');
+		reqbridge.expectResponse(1);
+	}
+	res.sendStatus(202);	// accepted
+// btw 'real' Pico buttons can be triggered remotely in a similar way, with 'real' button numbers for telnet, or maybe...
+// e.g. {"CommuniqueType":"CreateRequest","Header":{"Url":"/button/122/commandprocessor"},"Body":{"Command":{"CommandType":"PressAndHold"}}}
+});
+
+app.post('/setLevel', function(req, res) {
+	var lcbridgeix = parseRequestBridgeIX(req.body);
+	if (lcbridgeix < 0) {
+		res.sendStatus(404);	// we don't know this particular bridge
+		return;
+	}
+	var reqbridge = lutronBridge[lcbridgeix];
+  SMARTTHINGS_IP = req.ip;
+	console.log("ST bridge %d set level request %j",lcbridgeix,req.body);
+
+// ??? ST SmartApp can really just send device ID, as we can look up the zone locally if needed
+	if (reqbridge.telnetIsConnect && req.body.deviceID != null) {
+		reqbridge.telnetClient.write('#OUTPUT,' + req.body.deviceID + ',' + LIP_CMD_OUTPUT_SET + ',' + req.body.level + ' \r\n');
+		reqbridge.expectResponse(1);
+	} else {
+		reqbridge.writeSSL('{"CommuniqueType":"CreateRequest","Header":{"Url":"/zone/' + req.body.zone + '/commandprocessor"},"Body":{"Command":{"CommandType":"GoToLevel","Parameter":[{"Type":"Level","Value":' + req.body.level +'}]}}}\n');
+		reqbridge.expectResponse(1);
+	}
+	res.sendStatus(202);	// accepted
+});
+
+app.post('/on', function(req, res) {
+	var lcbridgeix = parseRequestBridgeIX(req.body);
+	if (lcbridgeix < 0) {
+		res.sendStatus(404);	// we don't know this particular bridge
+		return;
+	}
+	var reqbridge = lutronBridge[lcbridgeix];
+  SMARTTHINGS_IP = req.ip;
+	console.log("ST bridge %d on request %j",lcbridgeix,req.body);
+
+// ??? ST SmartApp can really just send device ID, as we can look up the zone locally if needed
+	if (reqbridge.telnetIsConnect && req.body.deviceID != null) {
+		reqbridge.telnetClient.write('#OUTPUT,' + req.body.deviceID + ',' + LIP_CMD_OUTPUT_SET + ',' + '100' + ' \r\n');
+		reqbridge.expectResponse(1);
+	} else {
+		reqbridge.writeSSL('{"CommuniqueType":"CreateRequest","Header":{"Url":"/zone/' + req.body.zone + '/commandprocessor"},"Body":{"Command":{"CommandType":"GoToLevel","Parameter":[{"Type":"Level","Value":' + '100' +'}]}}}\n');
+		reqbridge.expectResponse(1);
+	}
+	res.sendStatus(202);	// accepted
+});
+
+app.use(function(err, req, res, next){ // make sure this is the last express app.
+  console.error(err);
+  res.sendStatus(500);
+});
+
+process.on('uncaughtException', function (err) {
+  console.log('Caught exception: ',err.code);
+//  var stack = new Error().stack;
+//  console.log( stack );
+  throw(err);
+});
+
+process.on('exit', function(code) {
+  for (var i in lutronBridge) {
+	lutronBridge[i].disconnect();
+  }
+  console.log('\r\nExiting with code:', code);
+});
+
+process.on('SIGINT', function () {
+  //graceful shutdown on Ctrl+C
+  process.exit(2);
+});
+
+function parseRequestBridgeIX(reqbody) {
+  if (reqbody.bridgeSN === undefined)
+    return 0;	// compatibility default bridge=0
+  else {
+    if (!(reqbody.bridgeSN in lutronBridgeSN))
+      return -1;	// a specific bridge was requested but we don't know it (yet?)
+    else
+      return lutronBridgeSN[reqbody.bridgeSN];
+  }
+}
+
+function sendSmartThingsJSON(jsonData) {	// common fn to send to ST
+  if (ipaddr.isValid(SMARTTHINGS_IP)) {
+    var stip4 = ipaddr.process(SMARTTHINGS_IP).toString();	// ensure we don't have some weird IPv6-ifized IPv4
+    console.log('sending to ST @ %s',stip4);
+
+    request({
+	url: 'http:\/\/' + stip4 + ':' + STLAN_PORT,
+	method: "POST",
+	json: true,	// self-stringifies body object to JSON
+	body: jsonData
+    }, function (error, response, body){
+	if (error)
+	  throw(error);	// ??? this could use a little more finesse!
+       }); 
+  } else console.log('ST not connected yet!');
+}
+
+// object representing Lutron Caseta bridge
+function lcSmartBridge(lcbridgeix, lcbridgeip) {
+	this.bridgeix = lcbridgeix;
+	this.ip = lcbridgeip;
+	this.macaddr = null;
+	this.bridgeSN = "";
+	this.pro = false;
+	this.sslClient = null;
+	this.telnetClient = null;
+	this.telnetIsConnect = false;
+	this.leapDevices = null;
+	this.lipDevices = null;
+	this.scenesList = null;
+	this.expectedResponseCnt = 0;
+	this.timerResponse;
+	this.timerBackoff;
+	this.expectPingback = false;
+	this.flipPingTag = false;
+	this.intervalPing;
+	var self = this;	// this lc bridge
+
+	// track the minimum number of bridge responses expected and try to reconnect on failure
+	// parameter: expectedresponseinc:
+	//		not passed/undefined = return pending minimum response count
+	//		false/0 = reset and disable expected response monitor
+	//		+/-N = add or subtract N from pending minimum response count
+	this.expectResponse = function (expectedresponseincr) {
+		if (expectedresponseincr !== undefined) {
+			if (expectedresponseincr && expectedresponseincr > 0) {
+				self.expectedResponseCnt += Math.trunc(expectedresponseincr);
+				self.timerResponse = setTimeout(function lcbResponseTimeout() {
+					console.log('Lutron SmartBridge #%d isn\'t responding',self.bridgeix);
+					self.reconnect(true,500);
+				}, LCB_RESPONSE_TIMEOUT);
+			}
+			else {
+				if (!expectedresponseincr)	// unconditional disable & reset of response timeout
+					self.expectedResponseCnt = 0;
+				else
+					self.expectedResponseCnt += Math.trunc(expectedresponseincr);
+				if (self.expectedResponseCnt <= 0) {
+					self.expectedResponseCnt = 0;
+					if (self.timerResponse != null)
+						clearTimeout(self.timerResponse);
+				}
+			}
+		}
+		return self.expectedResponseCnt;
+	}
+
+	this.initialize = function(err, lcbinitcallback) {
+// ??? temporary macaddr handling
+if (!!sb_mac[0])
+	this.macaddr = sb_mac[0];
+	    connectSSL(false, function lcbGetInitialBridgeConfig(resumed) {
+// ??? maybe we want to set a timeout and return err if these initial requests are not filled
+		// request and await the initial devices list
+		console.log('Bridge #%d initial devices request',self.bridgeix);
+		lutronBridgeEvents.on(LBE_GOTDEVICES, function lbeInitGotDevices(gdbridgeix) {
+			if (gdbridgeix != self.bridgeix)
+				return;	// not this bridge, let another bridge's listener have it
+			lutronBridgeEvents.removeListener(LBE_GOTDEVICES, lbeInitGotDevices);
+
+			if (self.pro)	// wait until initial device list acquired before starting the Pro Bridge telnet client
+			    initTelnet();
+
+			// request and await the initial scenes list
+			console.log('Bridge #%d initial scenes request',self.bridgeix);
+			lutronBridgeEvents.on(LBE_GOTSCENES, function lbeInitGotScenes(gsbridgeix) {
+				if (gsbridgeix != self.bridgeix)
+					return;	// not this bridge, let another bridge's listener have it
+				lutronBridgeEvents.removeListener(LBE_GOTSCENES, lbeInitGotScenes);
+
+// ??? do we really want to force this update to SmartThings, or expect it to ask first? Maybe only if we know we're connected?
+				// roll through the device list and send level for anything marked with a zone # to SmartThings hub
+				console.log('Bridge #%d initial levels update request',self.bridgeix);
+				self.leapDevices.filter(function(brdev){return 'LocalZones' in brdev})
+					   	.forEach(function(brdev) {
+							for (var i in brdev.LocalZones) {
+								var devzone = brdev.LocalZones[i].href.replace( /\/zone\//i, '');
+								if (devzone)
+									self.leapRequestZoneLevel(devzone);
+							}
+						});
+
+				if (typeof lcbinitcallback === "function") {
+					lcbinitcallback();
+					return;
+				}
+			});
+			self.writeSSL(communiqueBridgeScenesRequest);
+			self.expectResponse(1);
+		});
+		self.writeSSL(communiqueBridgeDevicesRequest);
+		self.expectResponse(1);
+	    });
+	}
+
+	this.writeSSL = function(data,encoding,cb) {
+	    if (self.sslClient.destroyed) {
+		connectSSL(true, function lcbResumeSessionOnWrite(resumed) {
+		    self.sslClient.write(data);
+		});
+	    } else self.sslClient.write(data);
+	    if (typeof cb === "function")
+		cb();
+	}
+
+	function connectSSL(resume,cbonconnect) {
+	    var options = {};
+	    var authIndex = 0;
+
+	    self.expectResponse(false);	// disable expected response monitor
+	    if (resume) { // resume half-closed session
+		options = {
+		   session: self.sslSession,
+   		   rejectUnauthorized: false
+	        };
+	    } else { // new session -- we may need to try multiple certs/keys until we hit the right one for this bridge
+		options = {
+		   key:  fs.readFileSync('privateKey'), //key  : fs.readFileSync('private.pem'),
+		   cert : JSON.parse(fs.readFileSync('appCert')), //remote_signs_app_certificate
+		   ca: JSON.parse(fs.readFileSync('localCert')),  //local_signs_remote_certificate
+		   rejectUnauthorized: false,
+	//	   allowHalfOpen: true,	// allow other end to FIN w/o closing socket for writes
+		};
+	    }
+	    self.sslClient = tls.connect(8081, self.ip, options, function lcbConnected () {
+		console.log("Lutron SmartBridge #%d SSL %sconnected at " + Date.now(),self.bridgeix,(resume)? "re-":"");
+		self.sslClient.on('end', function() {
+		  console.log("Lutron SmartBridge #%d disconnected itself",self.bridgeix)
+		  // session is resumable if no error, so let it go for now
+		});
+		self.sslClient.on('close', function(erred) {
+		  console.log("Lutron SmartBridge #%d comm closed %s",self.bridgeix,(erred)? "with error":"normally")
+		  // session is resumable if no error, so let it go for now
+		});
+
+		if (!resume) {	// just turning on keep-alive didn't forstall half-disconnects, so... resume instead
+		  self.sslSession = Buffer.from(self.sslClient.getSession());	// save this for resumes afte FIN
+		  fs.writeFile(authFileWIndexExt(authIndex,"CertMAC"),JSON.stringify(self.macaddr));
+		}
+		listenSSL(handleIncomingSSLData);
+		if (!self.telnetIsConnect)
+		  self.setPingSSL();
+		if (typeof cbonconnect === "function")
+		    cbonconnect(resume);
+	    });
+	    setErrorHandlerSSL();
+	}
+
+	this.reconnect = function (attemptresume,backoffms) {
+	    if (self.sslClient !== null && !self.sslClient.destroyed) {
+		self.sslClient.destroy();
+	    }
+	    self.expectResponse(false);
+	    // kill the current pinger
+	    self.expectPingback = false;
+	    clearInterval(self.intervalPing);
+	    // wait a bit before trying to reconnect to the bridge
+	    self.timerBackoff = setTimeout(function() {
+		console.log("Lutron SmartBridge #%d reconnecting...",self.bridgeix);
+		connectSSL(attemptresume && (self.sslSession != null), function lcbReconnected(resumed) {
+		    if (!resumed || (self.telnetClient !== null && !self.telnetClient.destroyed)) {
+			self.telnetIsConnect = false;
+			self.telnetClient.destroy();
+			self.telnetClient = null;
+		    }
+		    if (self.pro)
+			initTelnet();
+		});
+	    }, backoffms);
+	}
+
+	this.disconnect = function() {
+		if (self.telnetIsConnect) {
+			self.telnetIsConnect = false;
+			self.telnetClient.end('LOGOUT\r\n');
+			self.telnetClient = null;
+		}
+		if (self.sslClient && !self.sslClient.destroyed) {
+			self.sslClient.destroy();
+		};
+	}
+
+	function handleIncomingSSLData(data) {
+		var jsonData = JSON.parse(data.toString());
+
+		if (jsonData.Header.MessageBodyType == 'OnePingResponse') {
+		  self.expectResponse(-1);
+                  self.expectPingback = false;
+		  self.flipPingTag = !lcBridge.flipPingTag;
+		  process.stdout.write('Pinged #'+self.bridgeix+' '+(self.flipPingTag?'S':'s')+'\r');
+		  return;
+		}
+		console.log('Incoming SSL is proper JSON');
+		console.log(data);	// moved here from SSL listener
+
+		if (jsonData.Header.MessageBodyType == 'OneLIPIdListDefinition') {
+		  console.log('LIP Data was received and sent to parser');
+		  self.expectResponse(-1);
+
+		  self.lipDevices = jsonData.Body.LIPIdList;
+
+		  // update LEAP data w/ LIP IDs in-place
+		  parseLip2Leap(self.lipDevices, self.leapDevices);
+		  console.log('The merged LEAP Data is: %o\n',self.leapDevices)
+		  lutronBridgeEvents.emit(LBE_GOTDEVICES,self.bridgeix);
+		} else if (jsonData.Header.MessageBodyType == 'MultipleDeviceDefinition') {
+		  console.log('LEAP Data was received and sent to parser');
+		  self.expectResponse(-1);
+
+		  self.leapDevices = jsonData.Body.Devices;
+
+		  // identify the bridge itself
+		  self.bridgeSN = self.leapDevices[0].SerialNumber;
+		  lutronBridgeSN[self.bridgeSN] = self.bridgeix;	// build the reverse lookup SN:index table
+
+		  // attach an initial ID to each device based on its /device/ii property (pro bridge LIP data may update it)
+		  // attach bridge SN to each device so we can tell them apart in requests
+		  for (var j in self.leapDevices) {
+                        try {
+                            self.leapDevices[j].ID = Number(self.leapDevices[j].href.replace( /\/device\//i, ''));
+                        } catch (e) { }
+			self.leapDevices[j].Bridge = self.bridgeSN;
+		  }
+
+// DEBUGGERY
+if (overrideNoPro) {
+	// pretend Pro bridge is Std, no Telnet
+	console.log('TEST Std Bridge');
+	lutronBridgeEvents.emit(LBE_GOTDEVICES,self.bridgeix);
+} else {
+		  if (self.leapDevices[0].ModelNumber.indexOf('PRO') != -1) {
+		    self.pro = true;
+		    console.log('Pro Bridge');
+		    // request the LIP device data, only available on the Pro hub
+		    self.writeSSL(communiqueBridgeLIPDevicesRequest);
+		    self.expectResponse(1);
+		  }
+		  else {
+		    console.log('Std Bridge');
+		    lutronBridgeEvents.emit(LBE_GOTDEVICES,self.bridgeix);
+		 }
+}
+		} else if (jsonData.Header.MessageBodyType == 'MultipleVirtualButtonDefinition') {
+		  console.log('Scene Data Received');
+		  self.expectResponse(-1);
+		  var buttons = jsonData.Body.VirtualButtons;
+		  var tempList = [];
+		  for (var i = 0; i < buttons.length; i++) {
+		    if (buttons[i].IsProgrammed == true) {
+			tempList[tempList.push(buttons[i])-1].Bridge = self.bridgeSN;
+		    }
+		  }
+		  self.scenesList = tempList;
+		  console.log(tempList);
+		  lutronBridgeEvents.emit(LBE_GOTSCENES,self.bridgeix);
+		} else { // some other response; just pass it along to Smartthings hub (redundant if PRO telnet)
+		  console.log("SSL data from %s Bridge %s",(self.pro)?"Pro":"Std",(self.telnetIsConnect)?"ignored":"sent to ST hub");
+		  if (!self.telnetIsConnect) {
+		    self.expectResponse(-1);
+
+		    // if it's a zone status update, translate to what the SmartApp understands
+		    // currently the SmartApp has a bug that skips LEAP-style status update messages :-(
+		    // ... so we'll use the 'Telnet' version instead for now
+		    if (jsonData.Header.MessageBodyType == 'OneZoneStatus' &&
+			jsonData.Header.StatusCode == '200 OK') {
+			var rzfld = jsonData.Header.Url.split('\/');
+			if (rzfld[0] == '' && rzfld[1] == 'zone' && rzfld[3] == 'status') {
+			    // determine the device ID from the zone's first matching device
+			    var dlevel = jsonData.Body.ZoneStatus.Level;
+			    var dix = self.leapDevices.findIndex(function(tdev) {
+				return (tdev.LocalZones &&
+				        jsonData.Body.ZoneStatus.Zone &&
+				        (tdev.LocalZones[0].href == jsonData.Body.ZoneStatus.Zone.href));
+			    });
+			    if (dix > 0 && self.leapDevices[dix].ID) {
+				jsonData = {bridge: self.bridgeSN, device: self.leapDevices[dix].ID, level: dlevel};
+			    }       // else no device with a matching zone, just fall through
+			}
+		    } // otherwise just send it along as-is and let the SmartApp deal with it!
+		    sendSmartThingsJSON(jsonData);
+		  }
+		}
+	}
+
+	function listenSSL(msgcallback) {
+		var bufferedData = '';
+
+		self.sslClient.on('data', function (data) {
+//			console.log('data in listenSSL');
+			bufferedData += data;
+			try {
 			  JSON.parse(bufferedData.toString());
 //			  console.log("Buffered data is proper json");
 			  var fullmessage = bufferedData;
 //			  console.log(fullmessage);
 			  bufferedData = '';
-			  callback(fullmessage);
-		  } catch (e) {
-			  console.log("json not valid, probably don't have it all yet");
+			  msgcallback(fullmessage);
+			  return;
+			} catch (e) {
+			  console.log('json not valid, probably don\'t have it all yet');
 //			  console.log(e);
-		  }
-	});
-}
-
-function getLEAP(conn, callback) {
-	console.log("Attempting to fetch LEAP Data");
-	conn.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
-}
-
-function leapLipParser(lipData, leapData, callback) {
-	var simplifyLip = [];
-	//Make the Devices and Zones objects a single array
-	for(var i = 0; i < lipData.Devices.length; i++) {
-		simplifyLip.push(lipData.Devices[i]);
-	}
-	if (lipData.Zones) {
-		for(var i = 0; i < lipData.Zones.length; i++) {
-			simplifyLip.push(lipData.Zones[i]);
-		}
-	}
-	//Add the LIP ID to the LEAP data 
-	for(i in simplifyLip) {
-		console.log(simplifyLip[i].Name);
-		for(j in leapData) {
-			console.log(leapData[j].Name);
-			if (simplifyLip[i].Name == leapData[j].Name) {
-				leapData[j]["ID"] = simplifyLip[i].ID;
-				console.log(leapData[j]["ID"]);
-				}
-		}
-		console.log(leapData);
-	}
-	//Check if there is a discrepancy between LEAP and LIP ID's and notify the user if there is
-	for(j in leapData) {
-		if (leapData[j]["ID"] != parseInt(leapData[j].href.substring(8))) {
-			console.log(leapData[j].Name);
-			console.log("The device ID's for leap and lip servers do not match! This might cause problems for you.");
-		}
-	}
-	callback(leapData);
-}
-
-var start;
-var timer;
-var interval;
-
-function telnetHandler(telnetClient, ip, callback) {
-
-	telnetClient.on('data', function(data) {
-
-		var elapsed;
-		var button;
-		var message
-		var buttonAction;
-
-	   console.log('Received: ' + data);
-	   if (data.toString().indexOf('login') !== -1) {
-		  telnetClient.write('lutron\r\n');
-	  } else if (data.toString().indexOf('password') !== -1) {
-			telnetClient.write('integration\r\n');
-	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
-		  isConnect = true;
-		  console.log("Connected!")
-	  } else if (data.toString().indexOf('~OUTPUT') !== -1) {
-		  console.log('Device update received\n likely a manual change');
-		  
-		  message = data.toString().split(',');
-		  var buttonLevel = message[3].split('.')[0];
-		  var myJSONObject = {device: message[1], level: buttonLevel};
-		  callback(myJSONObject);
-	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
-		  
-		  message = data.toString().split(',');
-		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
-		  //telnetClient.write(output);
-		
-		console.log(message[1]); 
-		console.log(buttonMethods);		
-		var match = buttonMethods.findIndex(function(i) {
-			return i.device == message[1];
+			}
 		});
-        console.log(match);
+	}
 
-		//Fix the button mappings
-		switch (message[2]) {
-		   case "2": button = 1
-					break
-		   case "3": button = 3
-					break
-		   case "4": button = 2
-					break
-		   case "5": button = 4
-					break
-		   case "6": button = 5
-					break
-		}
-		//console.log(buttonMethods[match][button]);
-		if (match != -1) {
-			if (buttonMethods[match][button]) {
-				rampHold();
-			} else {
-			longPressHold();
+	this.setPingSSL = function() {
+		// send an occasional ping to ensure we're still connected to the bridge
+		// if a telnet connection is made to a Pro bridge, that will assume ping handling
+		if (self.intervalPing)
+			clearInterval(self.intervalPing);
+		self.expectPingback = false;
+		self.intervalPing = setInterval(function() {
+		  if (!self.expectPingback && !self.expectResponse()) {
+		    process.stdout.write('                        \rPing #'+lcbridgeix+'... ');
+//		    console.log("Ping #%d",self.bridgeix);
+		    self.expectResponse(1);
+		    self.expectPingback = true;
+		    self.writeSSL(communiqueBridgePingRequest);
+		    // expected reply:
+		    // {"CommuniqueType":"ReadResponse","Header":{"MessageBodyType":"OnePingResponse","StatusCode":"200 OK","Url":"/server/status/ping"},"Body":{"PingResponse":{"LEAPVersion":1.106}}}
+		  }
+		  // else     we didn't get a ping response! OR avoid stepping on expected status response w/ping
+		    // defer further pings and wait out the socket timeout or other comm error that should ensue
+		}, LCB_PING_INTERVAL);
+	}
+
+	function setErrorHandlerSSL() {
+		self.sslClient.on('error', function errorHandlerSSL(err) {
+			console.log('Lutron SmartBridge #%d SSL comm error %s %s',self.bridgeix,err.code,err);
+			if (err.code === 'ETIMEDOUT' || err.code === 'EHOSTUNREACH') {
+			    // ... back off and retry connection
+			    self.reconnect(true, LCB_RECONNECT_DELAY);
 			}
-		} else {
-			longPressHold();
-		}
-		
-		  /*
-		  for (i in buttonMethods) {
-			  if (buttonMethods[i].device == message[1]) {
-				  console.log("Found a button map for this device");
-				  console.log(buttonMethods[i]);
-				 
-				  switch (message[2]) {
-					   case "2": button = 1
-								break
-					   case "3": button = 3
-								break
-					   case "4": button = 2
-								break
-					   case "5": button = 4
-								break
-					   case "6": button = 5
-								break
-					}
-				  if(buttonMethods[i][button]) {
-					  console.log("Button is true");
-					  rampHold();
-				  } else {
-					  console.log("Button is false");
-					  longPressHold();
-				  }
-			  } else {
-				longPressHold();
-			  }
-		  }
-		  */
-		function rampHold() {
-			console.log("ramp hold");
-			if (message[3] == 3) {
-			  start = new Date().getTime();
-			  timer = setTimeout(function() {
-				console.log("timer ran")
-				interval = setInterval(function() {
-					console.log("interval ran")
-					buttonAction = "held";
-					var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
-					callback(myJSONObject);
-					//send();
-					/*
-					elapsed = new Date().getTime() - start; 
-					if (elapsed <= 5999) {
-						send();
-					} else {
-						clearInterval(interval);
-					}
-				*/
-					/*
-					var myJSONObject = {device: message[1], button: message[2], action: "held"};
-					request({
-						url: 'http://' + SMARTTHINGS_IP + ':39500',
-						method: "POST",
-						json: true,
-						body: myJSONObject
-					}, function (error, response, body){
-					});
-					*/
-				}, intervalTime);
-			  }, shortPressTime);
-		  } else if (message[3] == 4) {
-			  clearTimeout(timer);
-			  clearInterval(interval);
-			  console.log("button was released");
-			  elapsed = new Date().getTime() - start; 
-			  console.log(elapsed);
-			  if (elapsed < shortPressTime) {
-				  buttonAction = "pushed";
-			  }
-			  var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
-			  callback(myJSONObject);
-			  //send();
-		  }
-		}
-		  
-		function longPressHold() {
-			console.log("long hold");
-			if (message[3] == 3) {
-				start = new Date().getTime();
-				/*
-				timer = setTimeout(function() {
-					console.log("time ran");
-				}, 500);
-				
-				*/
-			} else if (message[3] == 4) {
-				clearTimeout(timer);
-				console.log("button was released");
-				elapsed = new Date().getTime() - start; 
-				console.log(elapsed);
-				if (elapsed < shortPressTime) {
-					buttonAction = "pushed";
-				} else {
-					buttonAction = "held";
-				}
-				//Create the json Object to send to ST
-				var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
-				callback(myJSONObject);
+			else if ( err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET') {
+				// ... back off and restart connection from scratch
+				self.reconnect(false, 2 * LCB_RECONNECT_DELAY)
 			}
-		  }
-		
-		function send() {
-			console.log('in send');
-			
-			request({
-				url: 'http://' + SMARTTHINGS_IP + ':39500',
-				method: "POST",
-				json: true,
-				body: myJSONObject
-			}, function (error, response, body){
-			});
-			
-		  }
-	  }
-	});
-
-	/* This version does long presses but not multiple helds
-	var start;
-	var timer;
-	telnetClient.on('data', function(data) {
-
-		var elapsed;
-	   console.log('Received: ' + data);
-	   if (data.toString().indexOf('login') !== -1) {
-		  telnetClient.write('lutron\r\n');
-	  } else if (data.toString().indexOf('password') !== -1) {
-			telnetClient.write('integration\r\n');
-	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
-		  isConnect = true;
-		  console.log("Connected!")
-	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
-		  
-		  var message = data.toString().split(',');
-		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
-		  //telnetClient.write(output);
-		  if (message[3] == 3) {
-			  start = new Date().getTime();
-			  timer = setTimeout(function() {
-				console.log("time ran");
-			  }, 500);
-		  } else if (message[3] == 4) {
-			  clearTimeout(timer);
-			  console.log("button was released");
-			  elapsed = new Date().getTime() - start; 
-			  console.log(elapsed);
-			  var buttonAction;
-			  if (elapsed < 500) {
-				  buttonAction = "pushed";
-			  } else if (elapsed > 500) {
-				  buttonAction = "held";
-			  }
-			  var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
-			  request({
-				url: 'http://' + SMARTTHINGS_IP + ':39500',
-				method: "POST",
-				json: true,
-				body: myJSONObject
-			}, function (error, response, body){
-			}); 
-		  }
-	  }
-	});
-	*/
-
-	/*
-	var start;
-	var timer;
-	var interval;
-	telnetClient.on('data', function(data) {
-
-		var elapsed;
-	   console.log('Received: ' + data);
-	   if (data.toString().indexOf('login') !== -1) {
-		  telnetClient.write('lutron\r\n');
-	  } else if (data.toString().indexOf('password') !== -1) {
-			telnetClient.write('integration\r\n');
-	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
-		  isConnect = true;
-		  console.log("Connected!")
-	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
-		  
-		  var message = data.toString().split(',');
-		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
-		  //telnetClient.write(output);
-		  if (message[3] == 3) {
-			  start = new Date().getTime();
-			  timer = setTimeout(function() {
-				console.log("timer ran")
-				interval = setInterval(function() {
-					console.log("interval ran")
-					var myJSONObject = {device: message[1], button: message[2], action: "held"};
-					request({
-						url: 'http://' + SMARTTHINGS_IP + ':39500',
-						method: "POST",
-						json: true,
-						body: myJSONObject
-					}, function (error, response, body){
-					}); 
-				}, 1000);
-			  }, 500);
-		  } else if (message[3] == 4) {
-			  clearTimeout(timer);
-			  clearInterval(interval);
-			  console.log("button was released");
-			  elapsed = new Date().getTime() - start; 
-			  console.log(elapsed);
-			  var buttonAction;
-			  if (elapsed < 500) {
-				  buttonAction = "pushed";
-			  } else if (elapsed > 500) {
-				  buttonAction = "held";
-			  }
-			  var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
-			  request({
-				url: 'http://' + SMARTTHINGS_IP + ':39500',
-				method: "POST",
-				json: true,
-				body: myJSONObject
-			}, function (error, response, body){
-			}); 
-		  }
-	  }
-	});
-	*/
-	telnetClient.on('close', function() {
-		console.log("Disconnected from SmartBridgePro")
-	});
-	telnetClient.on('connect', function() {
-		console.log('Connected via telnet to Pro Hub');
-	});
-	
-	telnetClient.connect(23, ip, function() {
-	});
-	telnetClient.setKeepAlive(true,2000);
-}
-
-app.get('/devices', function(req, res) {
-	console.log("Request for Device List");
-	res.setHeader('Content-Type', 'application/json');
-	var combinedDevicesList = [];
-	for(i = 0; i < lutronBridges.length; i++) {
-		console.log(lutronBridges[i].ip);
-		lutronBridges[i].sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
-		lutronBridges[i].sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n');
-		if (lutronBridges[i].mergedDevices != null) {
-			console.log('pro hub data');
-			combinedDevicesList = combinedDevicesList.concat(lutronBridges[i].mergedDevices);
-		} else {
-			console.log('reg hub data');
-			combinedDevicesList = combinedDevicesList.concat(lutronBridges[i].leapDevices);
-		}
-	}
-	res.send(combinedDevicesList);
-});
-
-app.get('/scenes', function(req, res) {
-	console.log("Request for Scenes");
-	res.setHeader('Content-Type', 'application/json');
-	for(i = 0; i < lutronBridges.length; i++) {
-		console.log(lutronBridges[i].ip);
-		res.send(lutronBridges[i].scenesList);
-	}
-});
-
-app.post('/scene', function(req, res) {
-	console.log("got an scene request");
-	console.log(req.body.virtualButton);
-	//appTelnetClient.write("#DEVICE,1," + req.body.virtualButton + ",3\r\n"); 
-	res.sendStatus(200);
-	
-	appSSLClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + req.body.virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n')
-});
-
-app.post('/status', function(req,res) {
-        var deviceID = req.body.deviceID;
-        var deviceZone = req.body.zone;
-
-        console.log('ST status request: Device %d / Zone %d',deviceID,deviceZone);
-
-	// use the zone if available; otherwise reconstruct it from the deviceID, and vice versa
-	if (isConnect) {
-		brix = 0;
-		if (!deviceID) { // if no device ID to use with telnet, reconstruct it from zone
-			var dix = lutronBridges[brix].leapDevices.findIndex(function(tdev) {
-				return (tdev.LocalZones && (tdev.LocalZones[0].href == ('/zone/' + deviceZone)));
-			});
-			if (dix >= 0 && lutronBridges[brix].leapDevices[dix].ID)
-				deviceID = lutronBridges[brix].leapDevices[dix].ID;
-		}
-		if (deviceID) {
-			lutronBridges[brix].telnetClient.write('?OUTPUT,' + deviceID + ',' + '1' + '\r\n');
-			res.sendStatus(202);    // accepted
-			return;
-		} // else no device ID can be determined, fall through to try the non-Pro zone scheme
-	}
-	if (deviceZone)
-		lutronBridges[0].leapRequestZoneLevel(deviceZone);
-	res.sendStatus(202);	// accepted
-});
-
-app.post('/setLevel', function(req, res) {
-	console.log("got an on request");
-	console.log(req.body);
-	//s = parse('hello %s, how are you doing', my_name);
-	console.log(req.body.deviceID);
-	console.log(req.body.level);
-	if(req.body.deviceID != null) {
-		appTelnetClient.write('#OUTPUT,' + req.body.deviceID + ',1,' + req.body.level + ' \r\n');  //scenes
-		res.sendStatus(200);
-	} else {
-		appSSLClient.write('{"CommuniqueType":"CreateRequest","Header":{"Url":"/zone/' + req.body.zone + '/commandprocessor"},"Body":{"Command":{"CommandType":"GoToLevel","Parameter":[{"Type":"Level","Value":' + req.body.level +'}]}}}\n')
-	}
-	
-});
-
-app.post('/on', function(req, res) {
-	console.log("got an on request");
-	console.log(req.body.device);
-	console.log(req.body.level);
-	telnetClient.write("#DEVICE,1,1,3\r\n");  //scenes
-	res.sendStatus(200);
-});
-app.listen(5000);
-console.log('Listening on port 5000...');
-
-process.on('exit', function(code) {
-  console.log('About to exit with code:', code);
-});
-
-function Hub(ip) {
-	this.ip = ip;
-	this.pro = false;
-	this.sshClient = new sshClient();
-	this.sslClient = null;
-	this.telnetClient = null;
-	this.leapDevices = null;
-	this.lipDevices = null;
-	this.scenesList = null;
-	this.mergedDevices = null;
-
-	var self = this;
-	
-	this.initalize = function() {
-	  var options = {
-	   key:  fs.readFileSync('privateKey'), //key  : fs.readFileSync('private.pem'),
-	   cert : JSON.parse(fs.readFileSync('appCert')), //remote_signs_app_certificate
-	   ca: JSON.parse(fs.readFileSync('localCert')),  //local_signs_remote_certificate
-	   rejectUnauthorized: false
-	  };
-	   
-	  self.sslClient = tls.connect(8081, self.ip, options, function () {
-		console.log('connected at ' + Date.now());
-		appSSLClient = self.sslClient;
-		listenSSL(self.sslClient, self.ip, handleIncomingSSLData);
-		pingSSL();
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n');
-	  });
-	}
-
-	var intervalPing;
-	function pingSSL () {
-	  // send an occasional ping to ensure we stay connected to the bridge
-	  intervalPing = setInterval(function () {
-		console.log("Ping!");
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/status/ping"}}\n');
-		// expected reply:
-		// {"CommuniqueType":"ReadResponse","Header":{"MessageBodyType":"OnePingResponse","StatusCode":"200 OK","$
-	  }, 50000);
-	}
-
-	function handleIncomingSSLData(data) {
-		if (data.toString().indexOf('"OnePingResponse"') !== -1) {
-//			console.log("pinged!");
-			return;
-		}
-		console.log("Buffered data is proper json");	// moved this here from the listener
-		console.log(data);				// moved this here from the listener
-
-		if (data.toString().indexOf('LIPIdList') !== -1) {
-		  console.log('LIP Data was received and sent to parser');
-		  var jsonData = JSON.parse(data.toString());
-		  var initLip = !self.lipDevices;
-
-		  self.lipDevices = jsonData.Body.LIPIdList;
-		  leapLipParser(self.lipDevices, self.leapDevices, function(data) {
-			console.log("The merged data is:\n" + JSON.stringify(data))
-			self.mergedDevices = data;
-		  });
-
-		  if (initLip)		// don't init telnet connection until all initial bridge requests are returned
-			initTelnet();
-		} else if (data.toString().indexOf('"MultipleDeviceDefinition"') != -1) {
-		  console.log('Leap Data was received and sent to parser');
-		  var jsonData = JSON.parse(data.toString());
-		  var initLeap = !self.leapDevices;
-
-		  self.leapDevices = jsonData.Body.Devices;
-
-		  // attach an initial ID to each device based on its /device/iii property (pro bridge LIP may update it)
-		  for (var j in self.leapDevices) {
-			try {
-			    self.leapDevices[j].ID = Number(self.leapDevices[j].href.replace( /\/device\//i, ''));
-			} catch (e) { }
-		  }
-
-// ??? do we really want to force this update to SmartThings, or expect it to ask first?
-// ???  Maybe only if we know we're connected and SmartThings already knows about our devices?
-		  if (initLeap) {
-			// roll through the device list and send level for anything marked with a zone # to SmartThinghub
-			console.log('Initial levels update request');
-			self.leapDevices.filter(function(brdev){return 'LocalZones' in brdev})
-			                .forEach(function(brdev) {
-				for (var i in brdev.LocalZones) {
-					var devzone = brdev.LocalZones[i].href.replace( /\/zone\//i, '');
-					if (devzone)
-						self.leapRequestZoneLevel(devzone);
-				}
-			});
-		  }
-		  if(self.leapDevices[0].ModelNumber.indexOf('PRO') != -1) {
-		    self.pro = true;
-		    console.log('pro hub');
-		    // request LIP data from Pro hub, but don't init telnet until it is returned
-		    self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n');
-		  }
-		  else
-		    console.log('std hub');
-		} else if (data.toString().indexOf('MultipleVirtualButtonDefinition')  != -1) {
-			console.log('Scene Data Received');
-			var jsonData = JSON.parse(data.toString());
-			var buttons = jsonData.Body.VirtualButtons;
-			var tempList = [];
-			for (i = 0; i < buttons.length; i++) {
-				if (buttons[i].IsProgrammed == true) { 
-					tempList.push(buttons[i]);
-				}
+			else if (err.code !== undefined) { // likely not an SSL error, give up
+			    throw(err);
+			    return;
+			} else { // likely an SSL error following an ECONNRESET
+// ??? if it's a bad certificate, not much we can do until we have multi-cert handler
+			    if (err.message.indexOf('bad certificate') != -1 ||
+				err.message.indexOf('SSL alert number 42') != -1) {
+				console.log('Wrong Certificate for this bridge!',self.macaddr);
+				throw(err);
+				return;
+			    }
+// ???? otherwise let it go for now, maybe it's ok
 			}
-			self.scenesList = tempList;
-			console.log(tempList);
-			//Example Scene Call Device 1 (the hub) virtualbutton 2 action 3 (press)
-			//~DEVICE,1,2,3
-
-
-		} else {
-//			console.log('Pro=%s',self.pro);
-			if (!isConnect) {
-				var jsonData = JSON.parse(data.toString());
-
-				// if it's a zone status update, translate to what the SmartApp understands
-				// currently the SmartApp has a bug that skips LEAP-style status update messages :-(
-				// ... so we'll use the 'Telnet' version instead for now
-				if (jsonData.Header.MessageBodyType == 'OneZoneStatus' &&
-				    jsonData.Header.StatusCode == '200 OK') {
-					var rzfld = jsonData.Header.Url.split('\/');
-					if (rzfld[0] == '' && rzfld[1] == 'zone' && rzfld[3] == 'status') {
-						// determine the device ID from the zone's first matching device
-						var dlevel = jsonData.Body.ZoneStatus.Level;
-						var dix = self.leapDevices.findIndex(function(tdev) {
-							return (tdev.LocalZones &&
-								jsonData.Body.ZoneStatus.Zone &&
-								(tdev.LocalZones[0].href == jsonData.Body.ZoneStatus.Zone.href));
-						});
-						if (dix > 0 && self.leapDevices[dix].ID) {
-							jsonData = {device: self.leapDevices[dix].ID, level: dlevel};
-						}	// else no device with a matching zone, just fall through
-					}
-				} // otherwise just send it along as-is and let the SmartApp deal with it!
-
-				request({
-						url: 'http://' + SMARTTHINGS_IP + ':39500',
-						method: "POST",
-						json: true,
-						body: jsonData
-					}, function (error, response, body){
-						if (error)
-							throw(error);
-					}); 
-			}
-		}
+		});
 	}
 
 	function initTelnet() {
-		console.log("starting telnet connection")
+	    if (!self.telnetIsConnect) {
+		console.log('starting telnet connection')
+		self.telnetIsConnect = false;
+		if (self.telnetClient !== null && !self.telnetClient.destroyed)
+			self.telnetClient.destroy();
 		self.telnetClient = new net.Socket();
-		appTelnetClient = self.telnetClient;
-		telnetHandler(self.telnetClient, self.ip, handleIncomingTelnetData);
-	}
-	
-	function handleIncomingTelnetData(data) {
-		
-		request({
-				url: 'http://' + SMARTTHINGS_IP + ':39500',
-				method: "POST",
-				json: true,
-				body: data
-			}, function (error, response, body){
-		});
+		telnetHandler(self, sendSmartThingsJSON);
+	    }
 	}
 }
-Hub.prototype.leapRequestZoneLevel = function (deviceZone) {
-        this.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/zone/' + deviceZone + '/status"}}\n');
+lcSmartBridge.prototype.leapRequestZoneLevel = function (deviceZone) {
+	this.writeSSL('{"CommuniqueType":"ReadRequest","Header":{"Url":"/zone/' + deviceZone + '/status"}}\n');
+	this.expectResponse(1);
 }
 
-exports.startup = function(SB_IP, ST_IP, USER, PW, bMethods, spTime, intTime) {
-	user = USER;
-	pw = PW;
-	initalize(SB_IP, function () { 
-		for(i = 0; i < SB_IP.length; i++) {
-			console.log(SB_IP[i]);
-			lutronBridges.push(new Hub(SB_IP[i]));
-			lutronBridges[i].initalize();
+function ssdpConnectLocation() {
+	return 'http:\/\/' + ip.address() + ':' + stReqPort + (SMARTTHINGS_IP ? '/status' : '/connect');
+}
+
+exports.startup = function(SB_IP, ST_IP, lcbUser, lcbPassword, bMethods, spTime, intTime) {
+	// the Lutron account user/pw probably need to be spec'd per-bridge, as only one bridge per account
+	var user = lcbUser;
+	var pw = lcbPassword;
+
+
+// DEBUGGERY
+// ??? generalize this argument detector for position tolerance!
+	overrideNoPro = (process.argv.length > 2 && process.argv[2].toUpperCase() == 'NOPRO');
+
+	picoShortPressTime = spTime;
+	picoIntervalTime = intTime;
+
+	lutronAuthenticate(user, pw, function (authIndex) { 
+		assert(authIndex !== undefined); // bail out if we can't get the account certificate
+
+		// find one or more Lutron bridges, and continue monitoring for changes
+var bjDelayTimer = setTimeout(function () {
+console.log('RE-finding the Lutron SmartBridge (test bonjour)');
+var mdnsLutronBridge = mDNSHandler.find({ type: 'lutron' },
+					function sniffLutronBridges(lutronService,isupdate) {
+
+// we really want a notification when any of this changes, too
+    console.log('Lutron SmartBridge mDNS %s / now %d services',(isupdate)?'updated':'found',mdnsLutronBridge.services.length);
+    console.log('Lutron SmartBridge mDNS Name: ' + lutronService.name);
+    console.log('Lutron SmartBridge mDNS FQDN: ' + lutronService.fqdn);
+    console.log('Lutron SmartBridge mDNS IP: ' + lutronService.addresses[0]);
+    console.log('Lutron SmartBridge mDNS Host: ' + lutronService.host);
+    console.log('Lutron SmartBridge mDNS MAC: ' + lutronService.txt.macaddr);
+    console.log('Lutron SmartBridge mDNS TTL (sec): ' + lutronService.ttl);
+
+// only usable bridge if
+// mdnsLutronBridge.service[0].txt.fw_status == 'Noupdate'
+// mdnsLutronBridge.service[0].txt.nw_status == '11:InternetWorking'
+// mdnsLutronBridge.service[0].txt.st_status == 'good'
+// else flush, fall back and retry in a while
+
+    if (!lutronBridge[0] ||  lutronBridge[0].macaddr == lutronService.txt.macaddr) {
+	    SB_IP[0] = mdnsLutronBridge.services[0].addresses[0]; //should check if ipv4 !
+	    sb_mac[0] = lutronService.txt.macaddr;
+    }
+
+if (!isupdate && !lutronBridge[0]) {
+
+		for (var i = 0; i < SB_IP.length; i++) {
+			console.log('Lutron Bridge: %s',SB_IP[i]);
+			lutronBridge.push(new lcSmartBridge(i, SB_IP[i]));
+			lutronBridge[i].initialize();
+
+// ??? the button methods probably need to be spec'd per-bridge, but in the meantime...
+			picoButtonMethods[i] = [];
+			if (bMethods) {
+				if (bMethods[0].constructor === Array) {
+					if (bMethods.length > i)
+						picoButtonMethods[i] = bMethods[i];
+				}
+				else
+					picoButtonMethods[i] = bMethods;
+			}
 		}
+}
+});
+},1000);	// only delaying during this test else no answer sometimes
 		SMARTTHINGS_IP = ST_IP;
-		shortPressTime = spTime;
-		intervalTime = intTime;
-		buttonMethods = bMethods;
-		ssdp.start();
+
+		// find a localhost port we can use to receive ST requests, then advertise for ST connection
+		getport(DEFAULT_REQST_PORT, function (err,p) {
+			if (err) throw (err);
+
+			stReqPort = p;
+	                stReqServer = app.listen(stReqPort);
+	                console.log('Listening for SmartThings requests on port %d...',stReqPort);
+
+			//SSDP server for Service Discovery
+			ssdp = new ssdpServer({
+				sourcePort: 1900,
+			        udn: 'uuid:' + uuidv1(),
+		        	adInterval: 60000,
+				suppressRootDeviceAdvertisements: true,
+			//	location: 'http:\/\/' + ip.address() + ':' + DEFAULT_REQST_PORT + '/status',
+				location: ssdpConnectLocation,
+			});
+
+			ssdp.addUSN('urn:schemas-upnp-org:device:RPi_Lutron_Caseta:1');
+
+//			ssdp.on('advertise-alive', function (headers) { });
+
+//			ssdp.on('advertise-bye', function (headers) { });
+
+			process.on('exit', function(){
+				ssdp.stop() // advertise shutting down and stop listening 
+				stReqServer.close();
+			})
+
+			ssdp.start(); // start the SSDP advertisment once we're listening
+		});
 	});
 };
