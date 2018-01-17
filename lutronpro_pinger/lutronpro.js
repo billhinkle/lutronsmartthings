@@ -661,7 +661,7 @@ app.post('/scene', function(req, res) {
 	res.sendStatus(202);
 });
 
-app.post('/status', function(req,res) {
+app.post('/status', function(req, res) {
         var deviceID = req.body.deviceID;
         var deviceZone = req.body.zone;
 
@@ -694,7 +694,7 @@ app.post('/setLevel', function(req, res) {
 //	console.log(req.body.deviceID);
 //	console.log(req.body.level);
 	var brix = 0;
-	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,deviceLevel,res))
+	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,deviceLevel))
 		res.sendStatus(202);
 	else
 		res.sendStatus(410);
@@ -708,7 +708,7 @@ app.post('/on', function(req, res) {
 //	console.log(req.body.device);
 //	console.log(req.body.level);
 	var brix = 0;
-	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,100,res))
+	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,100))
 		res.sendStatus(202);
 	else
 		res.sendStatus(410);
@@ -780,13 +780,16 @@ function Hub(ip) {
 
 	var intervalPing;
 	var skatePing = 0;
+	const PING_WIDTH = 20;
+	const PING_INCR = 5;
 	function pingSSL () {
 	  // send an occasional ping to ensure we stay connected to the bridge
 	  intervalPing = setInterval(function () {
-		if (skatePing >= 20)
+		if (skatePing >= PING_WIDTH)
 			skatePing = 0;
-		skatePing += 5;
-		process.stdout.write("Ping!".padStart(skatePing).padEnd(20) + '\r');
+		skatePing += PING_INCR;
+//		process.stdout.write("Ping!".padStart(skatePing).padEnd(WIDTH_PING) + '\r');
+		process.stdout.write(' '.repeat(skatePing-PING_INCR) + 'Ping!' + ' '.repeat(PING_WIDTH-skatePing) + '\r');
 
 		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/status/ping"}}\n');
 		// expected reply:
