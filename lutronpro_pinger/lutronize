@@ -1,0 +1,99 @@
+#!/bin/bash
+# lutronize - send commands directly to the Lutron node server for SmartThings
+# don't forget to chmod +x lutronize
+# n.b. do yourself a favor: keeping further options in alphabetical order. / wjh 20180117 / Bill Hinkle
+lnsuri="http://localhost:5000/"
+
+if [ $# -eq 0 ]
+then
+	set -- "-h"
+fi
+while :
+do
+    case "$1" in
+      -h | --help)
+#	  display_help  # off to the help function
+	  echo ${0##*/}' [-h] | [[[-s scene#] | [-z zone# -l level%] | [-z zone# -o]] [-u target-uri]]'
+	  echo ${0##*/}' [--help] | [[[--scene scene#] | [--zone zone# --level level%] | [--zone zone# --on]] [--uri target-uri]]'
+	  echo 'Default target uri is:' $lnsuri
+	  echo 'Example: '${0##*/}' -s 3                      <-- set Lutron bridge scene 1'
+	  echo '         '${0##*/}' --zone 2 --level 50       <-- set Lutron bridge zone (dimmer) 2 to 50%'
+	  echo '         '${0##*/}' -z 1 --on                 <-- set Lutron bridge zone (dimmer) 1 to 100%' 
+	  # no shifting needed here, we're done.
+	  exit 0
+	  ;;
+      -l | --level)
+	  level="$2" # the server will check for validity and range: # only
+	  shift 2
+	  ;;
+      -o | --on)
+	  oncmd="on"  # overrides level to 100
+	  shift
+	  ;;
+      -s | --scene)
+	  scene="$2"   # the server will check for validity: # or name
+	  shift 2
+	  ;;
+      -u | --uri)
+	  lnsuri="%2"	# change the target URI
+	  shift 2
+	  ;;
+      -v | --verbose)
+	  verbose="verbose"
+	  shift
+	  ;;
+      -z | --zone)
+	  zone="$2" # the server will check for validity; lutron will check for range: # only
+	  shift 2
+	  ;;
+      --) # End of all options
+	  shift
+	  break;
+	  ;;
+      -*)
+	  echo "Error: Unknown option: $1" >&2
+	  exit 1
+	  ;;
+      *)  # No more options
+	  break
+	  ;;
+    esac
+done
+
+if [ "$scene" ]
+then
+	payload='{"virtualButton":"'"$scene"'"}'
+	method='scene'
+elif [ "$zone" ]
+then
+	if [ $oncmd ]
+	then
+		payload='{"zone":'$zone'}'
+		method='on'
+	else
+		if [ -z $level ]
+		then
+			level="0"
+		fi
+		payload='{"zone":'$zone',"level":'$level'}'
+		method='setLevel'
+	fi
+fi
+if [ "$payload" ]
+then
+	pllen=${#lnsuri}	# ensure uri ends with a / slash
+	pllastch=${lnsuri:pllen-1:1}
+	[[ $pllastch != "/" ]] && pllen="$pllen/"; :
+	SAVEIFS=$IFS
+	IFS=' '
+	hstatus=$(r=($(curl -s --connect-timeout 5 -H 'Content-Type: application/json' -d "$payload" "$lnsuri"$method 2>&1 || echo 500));echo ${r[0]})
+	IFS=$SAVEIFS
+
+	[ $hstatus = 'Accepted' ] && exit 0
+	[ $hstatus -ge 500 ] && echo "The Lutron bridge node server does not appear to be running at the moment!" && exit 2
+	[ $hrstatus -ge 400] && echo "Not a valid command, sorry" && exit 4
+	exit 3
+fi
+exit 1
+
+# End of file
