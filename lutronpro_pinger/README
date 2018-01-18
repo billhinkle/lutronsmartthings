@@ -2,3 +2,10 @@ Same as Nate Schwartz' lutronpro v1.1.0 with:
  v1.1.0.1 wjh added a 5-minute pinger to hold the Lutron Bridge SSL connection open
               (also some diagnostic logging was commented out and/or moved around a bit to hold down the console noise)
  v1.1.0.2 wjh cleaned up /status request (refresh request from SmartThings) and added initial level report to SmartThings
+              calmed down the pinger Ping! to just skate across a single line rather than scrolling the console
+ v1.1.0.3 wjh tuned up the SSDP to suppress root dev adverts, set unit USN uuid to an app-unique value rather than the
+              ssdp pkg default, factored out some default values, added an Express middleware .use to quiet down parse
+              errors on incoming, added some parameter checking to /setLevel and to /scene requests from SmartThings
+              to be a little friendlier to manual commands, allowed request by scene name rather than number also for
+              manual command.
+              
