@@ -1,6 +1,8 @@
 // original	1.1.0	nate schwartz
 // rev		1.1.0.1 wjh		added SSL ping every few minutes to hold open the SSL channel
 // rev		1.1.0.2 wjh		cleaned up /status request and added initial level report to SmartThings
+// rev		1.1.0.3 wjh		tuned up the SSDP to suppress root dev adverts, set unit USN uuid, factored out defaults
+//					added some parameter checking to scene requests from SmartThings & allowed request by scene name
 
 var net = require('net');
 var request = require('request');
@@ -30,6 +32,10 @@ var cookie;
 const CLIENT_ID = "e001a4471eb6152b7b3f35e549905fd8589dfcf57eb680b6fb37f20878c28e5a";
 const CLIENT_SECRET = "b07fee362538d6df3b129dc3026a72d27e1005a3d1e5839eed5ed18c63a89b27";
 const REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob";
+
+const SSDP_USN_UUID = 'f40c2981-7329-40b7-8b04-27f187aecfb5';
+const DEFAULT_SSDP_LOCATION = '/status';
+const DEFAULT_REQST_PORT = 5000;
 
 var appTelnetClient;
 var appSSLClient;
@@ -238,22 +244,24 @@ function getCerts() {
 
 //SSDP server for Service Discovery
 ssdp = new Server({
-    sourcePort: 1900,
-	location: 'http://' + ip.address() + ':5000/status',
+	sourcePort: 1900,
+	udn: 'uuid:' + SSDP_USN_UUID,   // derived from uuidv1(),
+	adInterval: 60000,
+	suppressRootDeviceAdvertisements: true,
+	location: 'http:\/\/' + ip.address() + ':' + DEFAULT_REQST_PORT + DEFAULT_SSDP_LOCATION
 });
- 
-    ssdp.addUSN('urn:schemas-upnp-org:device:RPi_Lutron_Caseta:1');
- 
-    ssdp.on('advertise-alive', function (headers) {
-    });
- 
-    ssdp.on('advertise-bye', function (headers) {
-    });
-    // start the server 
 
-    process.on('exit', function(){
+ssdp.addUSN('urn:schemas-upnp-org:device:RPi_Lutron_Caseta:1');
+
+//    ssdp.on('advertise-alive', function (headers) { });
+
+//    ssdp.on('advertise-bye', function (headers) { });
+
+// start the server later, when entirely initialized
+
+process.on('exit', function(){
       ssdp.stop() // advertise shutting down and stop listening 
-    })
+})
 
 var testData1 = '{"CommuniqueType":"ReadResponse","Header":'
 var testData2 = '{"MessageBodyType":"OneLIPIdListDefinition","StatusCode":"200 OK","Url":"/server/2/id"},"Body":{"LIPIdList":{"Devices":[{"Name":"Smart Bridge","ID":1,"Buttons":[{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1}]},{"Name":"Pico Test","ID":3,"Buttons":[{"Number":2},{"Number":3},{"Number":4},{"Number":5},{"Number":6}]}],"Zones":[{"Name":"Office","ID":2}]}}}'
@@ -654,11 +662,27 @@ app.get('/scenes', function(req, res) {
 
 app.post('/scene', function(req, res) {
 	console.log("got an scene request");
-	console.log(req.body.virtualButton);
+	var virtualButton = req.body.virtualButton;
+	console.log(virtualButton);
 	//appTelnetClient.write("#DEVICE,1," + req.body.virtualButton + ",3\r\n"); 
 
-	appSSLClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + req.body.virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n')
-	res.sendStatus(202);
+	var brix = 0;
+	var snnameix = -1;
+	if (virtualButton &&
+	    ((lutronBridges[brix].scenesList.findIndex(function(tsn) {
+		return (tsn.href && (tsn.href === ('/virtualbutton/' + virtualButton)));
+	      }) >= 0 ) ||
+	     ((snnameix = lutronBridges[brix].scenesList.findIndex(function(tsn) {
+		return (tsn.Name && (tsn.Name.toUpperCase() === virtualButton.toString().toUpperCase()));
+	      })) >= 0 ) ) )
+	{
+		if (snnameix >= 0) {
+			virtualButton = Number(lutronBridges[brix].scenesList[snnameix].href.replace( /\/virtualbutton\//i, ''));
+		}
+		lutronBridges[brix].sslClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n')
+		res.sendStatus(202);
+	} else
+		res.sendStatus(404);
 });
 
 app.post('/status', function(req, res) {
@@ -681,7 +705,7 @@ app.post('/status', function(req, res) {
 		res.sendStatus(202);	// accepted
 		return;
 	}
-	res.sendStatus(410);
+	res.sendStatus(404);
 });
 
 app.post('/setLevel', function(req, res) {
@@ -693,11 +717,13 @@ app.post('/setLevel', function(req, res) {
 //	console.log(req.body);
 //	console.log(req.body.deviceID);
 //	console.log(req.body.level);
+	deviceLevel = Math.round(Math.min(100, Math.max(0, deviceLevel)));
+
 	var brix = 0;
 	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,deviceLevel))
 		res.sendStatus(202);
 	else
-		res.sendStatus(410);
+		res.sendStatus(404);
 });
 
 app.post('/on', function(req, res) {
@@ -711,13 +737,13 @@ app.post('/on', function(req, res) {
 	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,100))
 		res.sendStatus(202);
 	else
-		res.sendStatus(410);
+		res.sendStatus(404);
 });
 
 function decipherDeviceID(bridgeIX,deviceID,deviceZone) {
 	if (!deviceID && deviceZone) { // if no device ID to use with telnet, reconstruct it from zone
 		var dix = lutronBridges[bridgeIX].leapDevices.findIndex(function(tdev) {
-			return (tdev.LocalZones && (tdev.LocalZones[0].href == ('/zone/' + deviceZone)));
+			return (tdev.LocalZones && (tdev.LocalZones[0].href === ('/zone/' + deviceZone)));
 		});
 		if (dix >= 0 && lutronBridges[bridgeIX].leapDevices[dix].ID)
 			deviceID = lutronBridges[bridgeIX].leapDevices[dix].ID;
@@ -740,8 +766,13 @@ function setDeviceLevelFromReq(bridgeIX,deviceID,deviceZone,deviceLevel) {
 	return false;
 }
 
-app.listen(5000);
-console.log('Listening on port 5000...');
+app.use(function(err, req, res, next){ // make sure this is the last express app middleware.
+  console.error(err);
+  res.sendStatus(400);
+});
+
+app.listen(DEFAULT_REQST_PORT);
+console.log('Listening on port %d...',DEFAULT_REQST_PORT);
 
 process.on('exit', function(code) {
   console.log('About to exit with code:', code);
@@ -767,7 +798,7 @@ function Hub(ip) {
 	   ca: JSON.parse(fs.readFileSync('localCert')),  //local_signs_remote_certificate
 	   rejectUnauthorized: false
 	  };
-	   
+
 	  self.sslClient = tls.connect(8081, self.ip, options, function () {
 		console.log('connected at ' + Date.now());
 		appSSLClient = self.sslClient;
@@ -780,15 +811,15 @@ function Hub(ip) {
 
 	var intervalPing;
 	var skatePing = 0;
-	const PING_WIDTH = 20;
-	const PING_INCR = 5;
+        const PING_WIDTH = 20;
+        const PING_INCR = 5;
 	function pingSSL () {
 	  // send an occasional ping to ensure we stay connected to the bridge
 	  intervalPing = setInterval(function () {
 		if (skatePing >= PING_WIDTH)
 			skatePing = 0;
 		skatePing += PING_INCR;
-//		process.stdout.write("Ping!".padStart(skatePing).padEnd(WIDTH_PING) + '\r');
+//		process.stdout.write("Ping!".padStart(skatePing).padEnd(PING_WIDTH) + '\r');
 		process.stdout.write(' '.repeat(skatePing-PING_INCR) + 'Ping!' + ' '.repeat(PING_WIDTH-skatePing) + '\r');
 
 		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/status/ping"}}\n');
