@@ -4,6 +4,35 @@
 # n.b. do yourself a favor: keeping further options in alphabetical order. / wjh 20180117 / Bill Hinkle
 lnsuri="http://localhost:5000/"
 
+errcho(){ >&2 echo $@; }
+isnumeric() { [[ $1 =~ ^[0-9]+$ ]] ; }
+
+listscenes(){
+  local sstr=$1
+  local srgx=\(.*\)\"\/virtualbutton\/\([0-9]+\)\",\"Name\":\(\".*\"\),
+  while [[ $sstr =~ $srgx ]]; do
+        echo ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}
+        sstr=${BASH_REMATCH[1]}
+  done | sort -n
+  echo $sall
+  return 0
+}
+listzones(){
+  local zstr=$1
+  local zrgx=\(.*\)\"FullyQualifiedName\":\\[\(\".*\"\)\\],.*\\[\\{\"href\":\"/zone\/\([0-9]+\)\"\\}[\],]
+#  local zrgx=\(.*\)\"FullyQualifiedName\":\\[\(\".*\"\)\\],.*\"SerialNumber\":\([0-9]+\)[,\\}]
+
+  while [[ $zstr =~ $zrgx ]]; do
+        zstr=${BASH_REMATCH[1]}
+        local znm=${BASH_REMATCH[2]}
+        local zzn=${BASH_REMATCH[3]}
+        if [[ $znm =~ \"(.*)\",\"(.*)\" ]] ; then znm=\"${BASH_REMATCH[1]}:${BASH_REMATCH[2]}\"; fi
+        echo $zzn $znm
+  done | sort -n
+  echo $zall
+  return 0
+}
+
 if [ $# -eq 0 ]
 then
 	set -- "-h"
@@ -12,30 +41,47 @@ while :
 do
     case "$1" in
       -h | --help)
-#	  display_help  # off to the help function
-	  echo ${0##*/}' [-h] | [[[-s scene#] | [-z zone# -l level%] | [-z zone# -o]] [-u target-uri]]'
-	  echo ${0##*/}' [--help] | [[[--scene scene#] | [--zone zone# --level level%] | [--zone zone# --on]] [--uri target-uri]]'
-	  echo 'Default target uri is:' $lnsuri
-	  echo 'Example: '${0##*/}' -s 3                      <-- set Lutron bridge scene 1'
-	  echo '         '${0##*/}' --zone 2 --level 50       <-- set Lutron bridge zone (dimmer) 2 to 50%'
-	  echo '         '${0##*/}' -z 1 --on                 <-- set Lutron bridge zone (dimmer) 1 to 100%' 
+          # display_help
+          echo ${0##*/}' [-h] | [[[-s scene#] | [[-z zone#] [[-l level%] | [-o]]] [options]'
+          echo ${0##*/}' [--help] | [[[--scene scene#] | [[--zone zone#] [[--level level%] | [--on]]] [options]'
+          echo 'Other options: [-u | --uri] target-uri         Default target uri is:' $lnsuri
+	  echo '               [-v | --verbose]                Echo the raw server response\/error'
+          echo 'Examples: '${0##*/}' -s 6                      <-- set Lutron bridge scene 6'
+          echo '          '${0##*/}' --zone 2 --level 50       <-- set Lutron bridge zone (dimmer) 2 to 50%'
+          echo '          '${0##*/}' -z 1 --on                 <-- set Lutron bridge zone (dimmer) 1 to 100%'
+	  echo '          '${0##*/}' -z 3                      <-- gets Lutron bridge zone (dimmer) 3 level 0-100 in %'
+	  echo 'v.3 Note: scene# may be specified by # or "Name"; zone# may be specified by #, "Name", or "Area:Name"'
+	  echo '          specify "?" for scene# or zone# (with quotes!) to get a list of scenes or zones'
 	  # no shifting needed here, we're done.
 	  exit 0
 	  ;;
       -l | --level)
 	  level="$2" # the server will check for validity and range: # only
+          if isnumeric $level ; then level=$((10#$level)) ; else errcho Level must be numeric 0-100 ; exit 3 ; fi
 	  shift 2
 	  ;;
       -o | --on)
 	  oncmd="on"  # overrides level to 100
 	  shift
 	  ;;
+      -qs)	# dump scenes
+          hmethod="GET"
+          method='scenes'
+          shift
+	 ;;
+      -qz)	# dump zones
+          hmethod="GET"
+          method='devices'
+          shift
+	 ;;
       -s | --scene)
 	  scene="$2"   # the server will check for validity: # or name
+#          isnumeric $scene || scene=\"$scene\"
+          if isnumeric $scene ; then scene=$((10#$scene)) ; else scene=\"$scene\" ; fi
 	  shift 2
 	  ;;
       -u | --uri)
-	  lnsuri="%2"	# change the target URI
+	  lnsuri="$2"	# change the target URI
 	  shift 2
 	  ;;
       -v | --verbose)
@@ -44,6 +90,8 @@ do
 	  ;;
       -z | --zone)
 	  zone="$2" # the server will check for validity; lutron will check for range: # only
+#          isnumeric $zone || zone=\"$zone\"
+          if isnumeric $zone ; then zone=$((10#$zone)) ; else zone=\"$zone\" ; fi
 	  shift 2
 	  ;;
       --) # End of all options
@@ -51,7 +99,7 @@ do
 	  break;
 	  ;;
       -*)
-	  echo "Error: Unknown option: $1" >&2
+	  errcho "Error: Unknown option: $1"
 	  exit 1
 	  ;;
       *)  # No more options
@@ -62,38 +110,63 @@ done
 
 if [ "$scene" ]
 then
-	payload='{"virtualButton":"'"$scene"'"}'
-	method='scene'
+	if [[ "$scene" == "?" ]]
+	then
+          hmethod="GET"
+          method='scenes'
+	else
+	  payload='{"virtualButton":'$scene'}'
+	  method='scene'
+	fi
 elif [ "$zone" ]
 then
-	if [ $oncmd ]
+	if [[ "$zone" == "?" ]]
+	then
+		hmethod="GET"
+		method='devices'
+	elif [ $oncmd ]
 	then
 		payload='{"zone":'$zone'}'
 		method='on'
 	else
 		if [ -z $level ]
 		then
-			level="0"
+			payload='{"zone":'$zone'}'
+			method='status'
+		else
+			payload='{"zone":'$zone',"level":'$level'}'
+			method='setLevel'
 		fi
-		payload='{"zone":'$zone',"level":'$level'}'
-		method='setLevel'
 	fi
 fi
-if [ "$payload" ]
+pllen=${#lnsuri}	# ensure uri ends with a slash
+pllastch=${lnsuri:pllen-1:1}
+[[ $pllastch != "/" ]] && pllen="$pllen/"; :
+if [ "$hmethod" == "GET" ]
 then
-	pllen=${#lnsuri}	# ensure uri ends with a / slash
-	pllastch=${lnsuri:pllen-1:1}
-	[[ $pllastch != "/" ]] && pllen="$pllen/"; :
 	SAVEIFS=$IFS
 	IFS=' '
-	hstatus=$(r=($(curl -s --connect-timeout 5 -H 'Content-Type: application/json' -d "$payload" "$lnsuri"$method 2>&1 || echo 500));echo ${r[0]})
+	lnsresp=$(curl -s --connect-timeout 5 -X GET -H 'Content-Type: application/json' "$lnsuri"$method 2>&1 || echo Server Timeout)
 	IFS=$SAVEIFS
-
-	[ $hstatus = 'Accepted' ] && exit 0
-	[ $hstatus -ge 500 ] && echo "The Lutron bridge node server does not appear to be running at the moment!" && exit 2
-	[ $hrstatus -ge 400] && echo "Not a valid command, sorry" && exit 4
-	exit 3
+elif [ "$payload" ]
+then
+	SAVEIFS=$IFS
+	IFS=' '
+	lnsresp=$(curl -s --connect-timeout 5 -H 'Content-Type: application/json' -d "$payload" "$lnsuri"$method 2>&1 || echo Server Timeout)
+	IFS=$SAVEIFS
+else
+	exit 1
 fi
-exit 1
+[[ $verbose ]] && echo $lnsresp\n
+[[ $lnsresp =~ ^Accepted ]] && exit 0
+[[ $lnsresp =~ ^Gateway.Timeout ]] && errcho The Lutron bridge did not respond && exit 2	# timeout @Lutron
+[[ $lnsresp =~ ^Server.Timeout ]] && errcho The Lutron bridge node server did not respond && exit 2
+[[ $lnsresp =~ .*\"Level\":([0-9]+) ]] && echo ${BASH_REMATCH[1]} && exit 0	# good level response
+[[ $hmethod == "GET" && $method == "devices" ]] && listzones  "$lnsresp" && exit 0
+[[ $hmethod == "GET" && $method == "scenes" ]]  && listscenes "$lnsresp" && exit 0
+! [[ $lnsresp =~ ^[0-9]+$ ]] && errcho $lnsresp && exit 3			# other response
+errcho Bad Request Err $lnsresp
+exit 3
 
 # End of file
+
