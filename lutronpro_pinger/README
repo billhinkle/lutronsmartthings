@@ -8,4 +8,5 @@ Same as Nate Schwartz' lutronpro v1.1.0 with:
               errors on incoming, added some parameter checking to /setLevel and to /scene requests from SmartThings
               to be a little friendlier to manual commands, allowed request by scene name rather than number also for
               manual command.
-              
+ 1.1.0.4 wjh  added direct response to /status request & allowed request by DeviceName or Area:DeviceName
+ 
