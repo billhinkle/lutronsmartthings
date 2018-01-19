@@ -3,7 +3,9 @@
 // rev		1.1.0.2 wjh		cleaned up /status request and added initial level report to SmartThings
 // rev		1.1.0.3 wjh		tuned up the SSDP to suppress root dev adverts, set unit USN uuid, factored out defaults
 //					added some parameter checking to scene requests from SmartThings & allowed request by scene name
+// rev		1.1.0.4 wjh		added direct response to /status request & allowed request by DeviceName or Area:DeviceName
 
+const eventEmitter = require('events');
 var net = require('net');
 var request = require('request');
 var express = require('express');
@@ -13,8 +15,7 @@ var tls = require('tls');
 var Server = require('node-ssdp').Server;
 var ip = require('ip');
 var fs = require('fs');
-var cmd = require('node-cmd');
-var CronJob = require('cron').CronJob;
+// var cmd = require('node-cmd');
 var forge = require('node-forge');
 var URLSearchParams = require('url-search-params');
 
@@ -46,6 +47,9 @@ var isConnect = false;
 var exports = module.exports = {};
 
 var lutronBridges = [];
+var lutronBridgeEvents = new eventEmitter();
+const LBE_GOTZLEVEL = 'gotzlevel';        // append bridge:zone indices
+
 var SMARTBRIDGE_IP;
 var SMARTTHINGS_IP;
 var buttonMethods;
@@ -77,9 +81,8 @@ function initalize(ip, cb) {
 			   //getCSR();
 			   startCodeFetch()
 			});
-			
+
 		}
-		
 	});
 }
 
@@ -105,7 +108,7 @@ function callSignIn() {
 	console.log(params);
 	request.post({
 		headers: {'content-type' : 'application/x-www-form-urlencoded', 'Cookie': cookie},
-		url:     'https://device-login.lutron.com/users/sign_in?' + params,                 
+		url:     'https://device-login.lutron.com/users/sign_in?' + params,
 		body: "",
 		}, function(error, response, body) {
 			cookie = response.headers['set-cookie'][0].trim();
@@ -163,7 +166,7 @@ function getCSR() {
 
 	// here we set subject and issuer as the same one
 	csr.setSubject(attrs);
-		
+
 	// the actual certificate signing
 	csr.sign(keys.privateKey);
     console.log(csr);
@@ -171,12 +174,12 @@ function getCSR() {
 	// now convert the Forge certificate to PEM format
 	var pem = forge.pki.certificationRequestToPem(csr);
 	console.log(pem);
-	
+
 	var strippedPem = pem.replace(/\r/g, "");
 	jsonKey = {"remote_signs_app_certificate_signing_request" : strippedPem};
 	console.log(JSON.stringify(jsonKey));
 	getAccessToken();
-	
+
 	/*
 	cmd.get(
 		'openssl req -new -key private.pem -out my-csr.pem -subj "/C=US/ST=Pennsylvania/L=Coopersburg/O=Lutron Electronics Co., Inc./CN=Lutron Caseta App"',
@@ -328,7 +331,9 @@ var start;
 var timer;
 var interval;
 
-function telnetHandler(telnetClient, ip, callback) {
+function telnetHandler(lcbridgeself, ip, callback) {
+	var lcBridge = lcbridgeself;
+	var telnetClient = lcbridgeself.telnetClient;
 
 	telnetClient.on('data', function(data) {
 
@@ -349,14 +354,21 @@ function telnetHandler(telnetClient, ip, callback) {
 		  console.log('Device update received\n possibly a manual change');
 
 		  message = data.toString().split(',');
-		  var dimmerLevel = Number(message[3]);	//was: message[3].split('.')[0];
+		  var deviceID = Number(message[1]);
+		  var dimmerLevel = Number(message[3]);
 		  if (!dimmerLevel)
 			dimmerLevel = 0;
 		  else
 			dimmerLevel = (dimmerLevel < 1.0)? 1 :  Math.round(dimmerLevel);
 
-		  var myJSONObject = {device: message[1], level: dimmerLevel.toString()};
-		  callback(myJSONObject);
+//		  var eventZLName = eventZoneLevel(lcBridge.lcbridgeix,lookupZoneByDeviceID(deviceID);
+//		  if (lutronBridgeEvents.listenerCount(eventZLName)) {
+//			lutronBridgeEvents.emit(eventZoneLevel(eventZLName,dimmerLevel));
+//		  }
+//		  else {
+			var myJSONObject = {device: deviceID.toString(), level: dimmerLevel.toString()};
+		  	callback(myJSONObject);
+//		  }
 	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
 
 		  message = data.toString().split(',');
@@ -393,7 +405,7 @@ function telnetHandler(telnetClient, ip, callback) {
 		} else {
 			longPressHold();
 		}
-		
+
 		  /*
 		  for (i in buttonMethods) {
 			  if (buttonMethods[i].device == message[1]) {
@@ -470,7 +482,7 @@ function telnetHandler(telnetClient, ip, callback) {
 			  //send();
 		  }
 		}
-		  
+ 
 		function longPressHold() {
 			console.log("long hold");
 			if (message[3] == 3) {
@@ -479,7 +491,7 @@ function telnetHandler(telnetClient, ip, callback) {
 				timer = setTimeout(function() {
 					console.log("time ran");
 				}, 500);
-				
+
 				*/
 			} else if (message[3] == 4) {
 				clearTimeout(timer);
@@ -621,10 +633,10 @@ function telnetHandler(telnetClient, ip, callback) {
 	});
 	*/
 	telnetClient.on('close', function() {
-		console.log("Disconnected from SmartBridgePro")
+		console.log("Disconnected telnet from Pro Bridge")
 	});
 	telnetClient.on('connect', function() {
-		console.log('Connected via telnet to Pro Hub');
+		console.log('Connected via telnet to Pro Bridge');
 	});
 
 	telnetClient.connect(23, ip, function() {
@@ -641,10 +653,10 @@ app.get('/devices', function(req, res) {
 		lutronBridges[i].sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
 		lutronBridges[i].sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n');
 		if (lutronBridges[i].mergedDevices != null) {
-			console.log('pro hub data');
+			console.log('pro bridge data');
 			combinedDevicesList = combinedDevicesList.concat(lutronBridges[i].mergedDevices);
 		} else {
-			console.log('reg hub data');
+			console.log('reg bridge data');
 			combinedDevicesList = combinedDevicesList.concat(lutronBridges[i].leapDevices);
 		}
 	}
@@ -689,23 +701,40 @@ app.post('/status', function(req, res) {
         var deviceID = req.body.deviceID;
         var deviceZone = req.body.zone;
 
-        console.log('ST status request: Device %d / Zone %d',deviceID,deviceZone);
+        console.log('ST status request: Device %d / Zone %s',deviceID,deviceZone);
 
 	var brix = 0;
 	if (isConnect) {
-		deviceID = decipherDeviceID(brix,deviceID,deviceZone);
+//		deviceID = lookupDeviceIDByZone(brix,deviceID,deviceZone);
 		if (deviceID) {
 			lutronBridges[brix].telnetClient.write('?OUTPUT,' + deviceID + ',' + '1' + '\r\n');
-			res.sendStatus(202);    // accepted
+			res.sendStatus(202);
 			return;
 		} // else no device ID can be determined, fall through to try the non-Pro zone scheme
 	}
+	deviceZone = lookupZoneByName(brix,deviceZone);
 	if (deviceZone) {
 		lutronBridges[brix].leapRequestZoneLevel(deviceZone);
-		res.sendStatus(202);	// accepted
-		return;
-	}
-	res.sendStatus(404);
+		var eventZLName = eventZoneLevel(brix,deviceZone);
+
+		var timerGetLevel;
+		var handlerGetLevel = function(jsonResponse) {
+			clearTimeout(timerGetLevel);
+
+                        res.setHeader('Content-Type', 'application/json');
+                        res.send(jsonResponse);
+			return;
+		}
+		timerGetLevel = setTimeout(function() {
+			lutronBridgeEvents.removeListener(eventZLName,handlerGetLevel);
+			res.sendStatus(504);	// timeout
+			return;
+		}, 1500);
+
+		lutronBridgeEvents.once(eventZLName, handlerGetLevel);
+//		res.sendStatus(202);	// accepted
+	} else
+		res.sendStatus(404);
 });
 
 app.post('/setLevel', function(req, res) {
@@ -717,10 +746,14 @@ app.post('/setLevel', function(req, res) {
 //	console.log(req.body);
 //	console.log(req.body.deviceID);
 //	console.log(req.body.level);
-	deviceLevel = Math.round(Math.min(100, Math.max(0, deviceLevel)));
-
+	try {
+		deviceLevel = Math.round(Math.min(100, Math.max(0, deviceLevel)));
+	}
+	catch (e) {
+		deviceLevel = 0;
+	}
 	var brix = 0;
-	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,deviceLevel))
+	if (setDeviceLevelFromReq(brix,deviceID,lookupZoneByName(brix,deviceZone),deviceLevel))
 		res.sendStatus(202);
 	else
 		res.sendStatus(404);
@@ -734,13 +767,17 @@ app.post('/on', function(req, res) {
 //	console.log(req.body.device);
 //	console.log(req.body.level);
 	var brix = 0;
-	if (setDeviceLevelFromReq(brix,deviceID,deviceZone,100))
+	if (setDeviceLevelFromReq(brix,deviceID,lookupZoneByName(brix,deviceZone),100))
 		res.sendStatus(202);
 	else
 		res.sendStatus(404);
 });
 
-function decipherDeviceID(bridgeIX,deviceID,deviceZone) {
+function eventZoneLevel(bridgeIX,deviceZone) {
+	return LBE_GOTZLEVEL+bridgeIX+":"+deviceZone;
+}
+
+function lookupDeviceIDByZone(bridgeIX,deviceID,deviceZone) {
 	if (!deviceID && deviceZone) { // if no device ID to use with telnet, reconstruct it from zone
 		var dix = lutronBridges[bridgeIX].leapDevices.findIndex(function(tdev) {
 			return (tdev.LocalZones && (tdev.LocalZones[0].href === ('/zone/' + deviceZone)));
@@ -751,9 +788,46 @@ function decipherDeviceID(bridgeIX,deviceID,deviceZone) {
 	return deviceID;
 }
 
+function lookupZoneByDeviceID(bridgeIX,deviceID,deviceZone) {
+	if (!deviceZone && deviceID) { // if no zone givem, reconstruct it from device ID
+		var dix = lutronBridges[bridgeIX].leapDevices.findIndex(function(tdev) {
+			return (tdev.LocalZones && (tdev.ID == deviceID));
+		});
+		if (dix >= 0)
+			deviceZone = lutronBridges[bridgeIX].leapDevices[dix].LocalZones[0].href.replace( /\/zone\//i, '');
+	}
+	return deviceZone;
+}
+
+function lookupZoneByName(bridgeIX,zoneName) {
+	var deviceZone;
+	if (!isNaN(zoneName)) {
+		deviceZone = Number(zoneName);
+		if (deviceZone <= 0)
+			deviceZone = 0;	// zero is invalid/non-existent zone
+	} else {
+		var fqdn = zoneName.split(':');	// either Name or Area:Name is ok
+		fqdn = fqdn.filter(function(e){return e});
+		var fqdnlen = fqdn.length;
+		if (fqdnlen < 1)
+			dix = -1;
+		else
+			var dix = lutronBridges[bridgeIX].leapDevices.findIndex(function(tdev) {
+				return (tdev.LocalZones &&
+					(fqdn[fqdnlen-1] === tdev.Name) &&
+					((fqdnlen < 2) || (fqdn[0] === tdev.FullyQualifiedName[0])));
+			});
+		if (dix >= 0)
+			deviceZone = Number(lutronBridges[bridgeIX].leapDevices[dix].LocalZones[0].href.replace( /\/zone\//i, ''));
+		else
+			deviceZone = 0;
+	}
+	return deviceZone;
+}
+
 function setDeviceLevelFromReq(bridgeIX,deviceID,deviceZone,deviceLevel) {
 	if (isConnect) {
-		deviceID = decipherDeviceID(bridgeIX,deviceID,deviceZone);
+		deviceID = lookupDeviceIDByZone(bridgeIX,deviceID,deviceZone);
 		if (deviceID) {
 			lutronBridges[bridgeIX].telnetClient.write('#OUTPUT,' + deviceID + ',1,' + deviceLevel + '\r\n');
 			return true;
@@ -778,7 +852,8 @@ process.on('exit', function(code) {
   console.log('About to exit with code:', code);
 });
 
-function Hub(ip) {
+function Bridge(brix,ip) {
+	this.lcbridgeix = brix;
 	this.ip = ip;
 	this.pro = false;
 	this.sshClient = new sshClient();
@@ -866,7 +941,7 @@ function Hub(ip) {
 // ??? do we really want to force this update to SmartThings, or expect it to ask first?
 // ???  Maybe only if we know we're connected and SmartThings already knows about our devices?
 		  if (initLeap) {
-			// roll through the device list and send level for anything marked with a zone # to SmartThinghub
+			// roll through the device list and send level for anything marked with a zone # to SmartThings hub
 			console.log('Initial levels update request');
 			self.leapDevices.filter(function(brdev){return 'LocalZones' in brdev})
 			                .forEach(function(brdev) {
@@ -879,12 +954,12 @@ function Hub(ip) {
 		  }
 		  if(self.leapDevices[0].ModelNumber.indexOf('PRO') != -1) {
 		    self.pro = true;
-		    console.log('pro hub');
-		    // request LIP data from Pro hub, but don't init telnet until it is returned
+		    console.log('pro bridge');
+		    // request LIP data from Pro bridge, but don't init telnet until it is returned
 		    self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n');
 		  }
 		  else
-		    console.log('reg hub');
+		    console.log('reg bridge');
 		} else if (data.toString().indexOf('MultipleVirtualButtonDefinition')  != -1) {
 			console.log('Scene Data Received');
 			var jsonData = JSON.parse(data.toString());
@@ -897,15 +972,23 @@ function Hub(ip) {
 			}
 			self.scenesList = tempList;
 			console.log(tempList);
-			//Example Scene Call Device 1 (the hub) virtualbutton 2 action 3 (press)
+			//Example Scene Call Device 1 (the bridge) virtualbutton 2 action 3 (press)
 			//~DEVICE,1,2,3
 
 
 		} else {
 //			console.log('Pro=%s',self.pro);
+			var jsonData = JSON.parse(data.toString());
+			if (data.toString().indexOf('OneZoneStatus')  != -1) {
+//				console.log('Zone Status Received');
+				var dimmerZone = jsonData.Body.ZoneStatus.Zone.href.replace( /\/zone\//i, '');
+				var eventZLName = eventZoneLevel(self.lcbridgeix,dimmerZone);
+				if (lutronBridgeEvents.listenerCount(eventZLName)) {
+					lutronBridgeEvents.emit(eventZLName,jsonData);
+					return;
+				}
+			}
 			if (!isConnect) {
-				var jsonData = JSON.parse(data.toString());
-
 				request({
 						url: 'http:\/\/' + SMARTTHINGS_IP + ':39500',
 						method: "POST",
@@ -923,7 +1006,7 @@ function Hub(ip) {
 		console.log("starting telnet connection")
 		self.telnetClient = new net.Socket();
 		appTelnetClient = self.telnetClient;
-		telnetHandler(self.telnetClient, self.ip, telnetJSONToSmartThings);
+		telnetHandler(self, self.ip, telnetJSONToSmartThings);
 	}
 
 	function telnetJSONToSmartThings(data) {
@@ -937,7 +1020,7 @@ function Hub(ip) {
 		});
 	}
 }
-Hub.prototype.leapRequestZoneLevel = function (deviceZone) {
+Bridge.prototype.leapRequestZoneLevel = function (deviceZone) {
         this.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/zone/' + deviceZone + '/status"}}\n');
 }
 
@@ -947,7 +1030,7 @@ exports.startup = function(SB_IP, ST_IP, USER, PW, bMethods, spTime, intTime) {
 	initalize(SB_IP, function () { 
 		for(i = 0; i < SB_IP.length; i++) {
 			console.log(SB_IP[i]);
-			lutronBridges.push(new Hub(SB_IP[i]));
+			lutronBridges.push(new Bridge(i,SB_IP[i]));
 			lutronBridges[i].initalize();
 		}
 		SMARTTHINGS_IP = ST_IP;
