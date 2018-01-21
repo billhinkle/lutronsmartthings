@@ -51,7 +51,7 @@ do
           echo '          '${0##*/}' -z 1 --on                 <-- set Lutron bridge zone (dimmer) 1 to 100%'
 	  echo '          '${0##*/}' -z 3                      <-- gets Lutron bridge zone (dimmer) 3 level 0-100 in %'
 	  echo 'v.3 Note: scene# may be specified by # or "Name"; zone# may be specified by #, "Name", or "Area:Name"'
-	  echo '          specify "?" for scene# or zone# (with quotes!) to get a list of scenes or zones'
+	  echo '          leave scene# or zone# blank to get a list of scenes or zones'
 	  # no shifting needed here, we're done.
 	  exit 0
 	  ;;
@@ -77,8 +77,16 @@ do
       -s | --scene)
 	  scene="$2"   # the server will check for validity: # or name
 #          isnumeric $scene || scene=\"$scene\"
-          if isnumeric $scene ; then scene=$((10#$scene)) ; else scene=\"$scene\" ; fi
-	  shift 2
+          if [[ -z $scene || $scene =~ \-.* ]]
+	  then
+            hmethod="GET"
+            method='scenes'
+            scene=
+            shift
+          else
+            if isnumeric $scene ; then scene=$((10#$scene)) ; else scene=\"$scene\" ; fi
+            shift 2
+          fi
 	  ;;
       -u | --uri)
 	  lnsuri="$2"	# change the target URI
@@ -91,8 +99,16 @@ do
       -z | --zone)
 	  zone="$2" # the server will check for validity; lutron will check for range: # only
 #          isnumeric $zone || zone=\"$zone\"
-          if isnumeric $zone ; then zone=$((10#$zone)) ; else zone=\"$zone\" ; fi
-	  shift 2
+          if [[ -z $zone || $zone =~ \-.* ]]
+	  then
+            hmethod="GET"
+            method='devices'
+            zone=
+            shift
+          else
+            if isnumeric $zone ; then zone=$((10#$zone)) ; else zone=\"$zone\" ; fi
+            shift 2
+          fi
 	  ;;
       --) # End of all options
 	  shift
@@ -110,21 +126,11 @@ done
 
 if [ "$scene" ]
 then
-	if [[ "$scene" == "?" ]]
-	then
-          hmethod="GET"
-          method='scenes'
-	else
-	  payload='{"virtualButton":'$scene'}'
-	  method='scene'
-	fi
+	payload='{"virtualButton":'$scene'}'
+	method='scene'
 elif [ "$zone" ]
 then
-	if [[ "$zone" == "?" ]]
-	then
-		hmethod="GET"
-		method='devices'
-	elif [ $oncmd ]
+	if [ $oncmd ]
 	then
 		payload='{"zone":'$zone'}'
 		method='on'
