@@ -4,6 +4,9 @@
 // rev		1.1.0.3 wjh		tuned up the SSDP to suppress root dev adverts, set unit USN uuid, factored out defaults
 //					added some parameter checking to scene requests from SmartThings & allowed request by scene name
 // rev		1.1.0.4 wjh		added direct response to /status request & allowed request by DeviceName or Area:DeviceName
+// rev		1.1.0.5 wjh		modified Pro hub detection to use presence of enabled LIP server on the bridge; should allow RA+ Select also
+//					modified LIP-LEAP device matching to take Area (Room) into account, if present
+//					tempory patch to make 4-button Picos look like 3RS-Button Picos until SmartApp/Device Handlers can be updated
 
 const eventEmitter = require('events');
 var net = require('net');
@@ -295,35 +298,45 @@ function getLEAP(conn, callback) {
 }
 
 function leapLipParser(lipData, leapData, callback) {
-	var simplifyLip = [];
-	//Make the Devices and Zones objects a single array
-	for(var i = 0; i < lipData.Devices.length; i++) {
-		simplifyLip.push(lipData.Devices[i]);
+	var lipComplete = [];
+	// Make the Devices (Picos... shades too?) and Zones (Lighting) objects a single array
+	for (var i = 0; i < lipData.Devices.length; i++) {
+		lipComplete.push(lipData.Devices[i]);
 	}
 	if (lipData.Zones) {
-		for(var i = 0; i < lipData.Zones.length; i++) {
-			simplifyLip.push(lipData.Zones[i]);
+		for (var i = 0; i < lipData.Zones.length; i++) {
+			lipComplete.push(lipData.Zones[i]);
 		}
 	}
-	//Add the LIP ID to the LEAP data 
-	for(i in simplifyLip) {
-		console.log(simplifyLip[i].Name);
-		for(j in leapData) {
-			console.log(leapData[j].Name);
-			if (simplifyLip[i].Name == leapData[j].Name) {
-				leapData[j]["ID"] = simplifyLip[i].ID;
-				console.log(leapData[j]["ID"]);
+	var idMismatches = 0;
+	var idUnmatched = lipComplete.length;
+	// Add the LIP ID to the LEAP data, matching by device name and area, if available
+	for (var i in lipComplete) {
+		console.log("Matching LIP: ",lipComplete[i].Name);
+		for (var j in leapData) {
+//			console.log(leapData[j].Name);
+			if (leapData[j].ID === undefined &&
+			    lipComplete[i].Name == leapData[j].Name &&
+			    (lipComplete[i].Area === undefined ||
+			     (leapData[j].FullyQualifiedName.length > 1 &&
+			      lipComplete[i].Area.Name == leapData[j].FullyQualifiedName[0]))) {
+
+				console.log("Matched LEAP name to LIP ID: ",lipComplete[i].ID);
+				leapData[j]["ID"] = lipComplete[i].ID;
+				idUnmatched--;
+				if (leapData[j].ID != Number(leapData[j].href.replace( /\/device\//i, ''))) { // '/device/xxx'
+					console.log("Device %s ID mismatch",leapData[j].FullyQualifiedName);
+					idMismatches++;
 				}
+			}
 		}
-		console.log(leapData);
+//		console.log(leapData);
 	}
-	//Check if there is a discrepancy between LEAP and LIP ID's and notify the user if there is
-	for(j in leapData) {
-		if (leapData[j]["ID"] != parseInt(leapData[j].href.substring(8))) {
-			console.log(leapData[j].Name);
-			console.log("The device ID's for leap and lip servers do not match! This might cause problems for you.");
-		}
-	}
+	// Check if there is a discrepancy between LEAP and LIP ID's and notify the user if there is
+	if (idUnmatched)
+		console.log("%d devices from LIP server do not match anything from LEAP server! This might cause problems for you.",idUnmatched);
+	if (idMismatches)
+		console.log("%d device ID(s) for LEAP and LIP servers do not match! This might cause problems for you.",idMismatches);
 	callback(leapData);
 }
 
@@ -372,8 +385,6 @@ function telnetHandler(lcbridgeself, ip, callback) {
 	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
 
 		  message = data.toString().split(',');
-		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
-		  //telnetClient.write(output);
 
 		console.log(message[1]);
 		console.log(buttonMethods);
@@ -384,16 +395,20 @@ function telnetHandler(lcbridgeself, ip, callback) {
 
 		//Fix the button mappings
 		switch (message[2]) {
-		   case "2": button = 1
-					break
-		   case "3": button = 3
-					break
-		   case "4": button = 2
-					break
-		   case "5": button = 4
-					break
-		   case "6": button = 5
-					break
+		   case "8": message[2] = "2";	// hokey patch for 4-button Pico
+		   case "2": button = 1;
+					break;
+		   case "3": button = 3;
+					break;
+		   case "11": message[2] = "4";	// hokey patch for 4-button Pico
+		   case "4": button = 2;
+					break;
+		   case "9": message[2] = "5";	// hokey patch for 4-button Pico
+		   case "5": button = 4;
+					break;
+		   case "10": message[2] = "6";	// hokey patch for 4-button Pico
+		   case "6": button = 5;
+					break;
 		}
 		//console.log(buttonMethods[match][button]);
 		if (match != -1) {
@@ -660,7 +675,7 @@ app.get('/devices', function(req, res) {
 			combinedDevicesList = combinedDevicesList.concat(lutronBridges[i].leapDevices);
 		}
 	}
-	res.send(combinedDevicesList);
+	res.send(combinedDevicesList);	// ??? this response really should be deferred until the fresh device data is returned
 });
 
 app.get('/scenes', function(req, res) {
@@ -668,7 +683,7 @@ app.get('/scenes', function(req, res) {
 	res.setHeader('Content-Type', 'application/json');
 	for(i = 0; i < lutronBridges.length; i++) {
 		console.log(lutronBridges[i].ip);
-		res.send(lutronBridges[i].scenesList);
+		res.send(lutronBridges[i].scenesList);	// ??? this reply really should be deferred until fresh scene data is requested/returned
 	}
 });
 
@@ -856,6 +871,7 @@ function Bridge(brix,ip) {
 	this.lcbridgeix = brix;
 	this.ip = ip;
 	this.pro = false;
+	this.lipServerIDHref;
 	this.sshClient = new sshClient();
 	this.sslClient = null;
 	this.telnetClient = null;
@@ -879,8 +895,7 @@ function Bridge(brix,ip) {
 		appSSLClient = self.sslClient;
 		listenSSL(self.sslClient, self.ip, handleIncomingSSLData);
 		pingSSL();
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
-		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n');
+		self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server"}}\n');
 	  });
 	}
 
@@ -911,12 +926,39 @@ function Bridge(brix,ip) {
 		console.log("Buffered data is proper json");	// moved this here from the listener
 		console.log(data);				// moved this here from the listener
 
-		if (data.toString().indexOf('LIPIdList') !== -1) {
+		if (data.toString().indexOf('MultipleServerDefinition') !== -1) {
+		  console.log('Intra-bridge server list received');
+		  var jsonData = JSON.parse(data.toString());
+
+		  self.pro = false;
+		  var lipServer = jsonData.Body.Servers.find(function(s) {return (s.Type == 'LIP')});
+		  if (lipServer) {
+			console.log('Pro/RA+Select Bridge');
+			if (lipServer.EnableState == 'Enabled') {
+			  self.pro = true;
+			  self.lipServerIDHref = lipServer.LIPProperties.Ids.href;
+			} else
+			  console.log('Lutron app Settings/Advanced/Integration/Telnet is turned off!');
+		  } else
+			console.log('Std Bridge');
+
+		  // now get the device and scene info
+		  self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/device"}}\n');
+		  self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/virtualbutton"}}\n');
+
+		} else if (data.toString().indexOf('LIPIdList') !== -1) {
 		  console.log('LIP Data was received and sent to parser');
 		  var jsonData = JSON.parse(data.toString());
 		  var initLip = !self.lipDevices;
 
 		  self.lipDevices = jsonData.Body.LIPIdList;
+
+		  // hokey patch for 4-button Pico: make it look & act like a 3RL Pico
+		  self.leapDevices.forEach(function Pico4to3(dev, ix, leapDevs) {
+			if (dev.DeviceType.indexOf('Pico4Button') === 0)
+			  leapDevs[ix].DeviceType = 'Pico3ButtonRaiseLower';
+		  });
+
 		  leapLipParser(self.lipDevices, self.leapDevices, function(data) {
 			console.log("The merged data is:\n" + JSON.stringify(data))
 			self.mergedDevices = data;
@@ -930,13 +972,6 @@ function Bridge(brix,ip) {
 		  var initLeap = !self.leapDevices;
 
 		  self.leapDevices = jsonData.Body.Devices;
-
-		  // attach an initial ID to each device based on its /device/iii property (pro bridge LIP may update it)
-		  for (var j in self.leapDevices) {
-			try {
-			    self.leapDevices[j].ID = Number(self.leapDevices[j].href.replace( /\/device\//i, ''));
-			} catch (e) { }
-		  }
 
 // ??? do we really want to force this update to SmartThings, or expect it to ask first?
 // ???  Maybe only if we know we're connected and SmartThings already knows about our devices?
@@ -952,14 +987,16 @@ function Bridge(brix,ip) {
 				}
 			});
 		  }
-		  if(self.leapDevices[0].ModelNumber.indexOf('PRO') != -1) {
-		    self.pro = true;
-		    console.log('pro bridge');
+		  if (self.pro) {
 		    // request LIP data from Pro bridge, but don't init telnet until it is returned
-		    self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/2/id"}}\n');
+		    self.sslClient.write('{"CommuniqueType":"ReadRequest","Header":{"Url":"' + self.lipServerIDHref + '"}}\n');
+		  } else {	// for non-Pro bridge, attach an initial ID to each device based on its /device/iii property
+			for (var j in self.leapDevices) {
+			  try {
+				self.leapDevices[j].ID = Number(self.leapDevices[j].href.replace( /\/device\//i, ''));
+			  } catch (e) { }
+			}
 		  }
-		  else
-		    console.log('reg bridge');
 		} else if (data.toString().indexOf('MultipleVirtualButtonDefinition')  != -1) {
 			console.log('Scene Data Received');
 			var jsonData = JSON.parse(data.toString());
