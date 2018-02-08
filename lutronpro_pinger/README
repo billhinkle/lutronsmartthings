@@ -9,4 +9,7 @@ Same as Nate Schwartz' lutronpro v1.1.0 with:
               to be a little friendlier to manual commands, allowed request by scene name rather than number also for
               manual command.
  1.1.0.4 wjh  added direct response to /status request & allowed request by DeviceName or Area:DeviceName
- 
+ 1.1.0.5 wjh  modified Pro hub detection to use presence of enabled LIP server on the bridge; should allow RA+ Select also
+              modified LIP-LEAP device matching to take Area (Room) into account, if present
+              tempory patch to make 4-button Picos look like 3RS-Button Picos until SmartApp/Device Handlers can be updated
+              
