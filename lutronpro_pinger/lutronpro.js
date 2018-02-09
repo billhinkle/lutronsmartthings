@@ -6,7 +6,8 @@
 // rev		1.1.0.4 wjh		added direct response to /status request & allowed request by DeviceName or Area:DeviceName
 // rev		1.1.0.5 wjh		modified Pro hub detection to use presence of enabled LIP server on the bridge; should allow RA+ Select also
 //					modified LIP-LEAP device matching to take Area (Room) into account, if present
-//					temporary patch to make 4-button Picos look like 3RS-Button Picos until SmartApp/Device Handlers can be updated
+//					temporary patch to make 4-button Picos look like 3BRL Picos until SmartApp/Device Handlers can be updated
+// rev		1.1.0.6 wjh		temporary patch to make 2BRL Pico look like 3BRL Pico & dupe its Lower button onto a phantom Favorites for Stringify
 
 const eventEmitter = require('events');
 var net = require('net');
@@ -354,6 +355,7 @@ function telnetHandler(lcbridgeself, ip, callback) {
 		var button;
 		var message
 		var buttonAction;
+		var dupeLB6ToLB3;
 
 	   console.log('Received: ' + data);
 	   if (data.toString().indexOf('login') !== -1) {
@@ -410,6 +412,17 @@ function telnetHandler(lcbridgeself, ip, callback) {
 		   case "6": button = 5;
 					break;
 		}
+		// hokey patch for 2-button-Raise-Lower Pico to duplicate the Lower button onto the missing Favorite button
+		try {
+			dupeLB6ToLB3 = (message[2] == "6") && 
+						   (lcBridge.leapDevices.find(function(tdev) {
+								return (tdev.ID == message[1]);
+							}).ModelNumber.indexOf('-2BRL') !== -1);
+		}
+		catch (e) {
+			dupeLB6ToLB3 = false;
+		}
+
 		//console.log(buttonMethods[match][button]);
 		if (match != -1) {
 			if (buttonMethods[match][button]) {
@@ -462,6 +475,11 @@ function telnetHandler(lcbridgeself, ip, callback) {
 					buttonAction = "held";
 					var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
 					callback(myJSONObject);
+
+					if (dupeLB6ToLB3) {	// hokey patch for 2-button-Raise-Lower Pico
+						myJSONObject = {device: message[1], button: "3", action: buttonAction };
+						callback(myJSONObject);
+					}
 					//send();
 					/*
 					elapsed = new Date().getTime() - start; 
@@ -494,6 +512,12 @@ function telnetHandler(lcbridgeself, ip, callback) {
 			  }
 			  var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
 			  callback(myJSONObject);
+
+			  if (dupeLB6ToLB3) {	// hokey patch for 2-button-Raise-Lower Pico
+				myJSONObject = {device: message[1], button: "3", action: buttonAction };
+				callback(myJSONObject);
+			  }
+
 			  //send();
 		  }
 		}
@@ -521,6 +545,11 @@ function telnetHandler(lcbridgeself, ip, callback) {
 				//Create the json Object to send to ST
 				var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
 				callback(myJSONObject);
+
+				if (dupeLB6ToLB3) {	// hokey patch for 2-button-Raise-Lower Pico
+				  myJSONObject = {device: message[1], button: "3", action: buttonAction };
+				  callback(myJSONObject);
+				}
 			}
 		  }
 		
@@ -804,7 +833,7 @@ function lookupDeviceIDByZone(bridgeIX,deviceID,deviceZone) {
 }
 
 function lookupZoneByDeviceID(bridgeIX,deviceID,deviceZone) {
-	if (!deviceZone && deviceID) { // if no zone givem, reconstruct it from device ID
+	if (!deviceZone && deviceID) { // if no zone given, reconstruct it from device ID
 		var dix = lutronBridges[bridgeIX].leapDevices.findIndex(function(tdev) {
 			return (tdev.LocalZones && (tdev.ID == deviceID));
 		});
