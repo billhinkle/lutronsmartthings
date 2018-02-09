@@ -6,7 +6,7 @@
 // rev		1.1.0.4 wjh		added direct response to /status request & allowed request by DeviceName or Area:DeviceName
 // rev		1.1.0.5 wjh		modified Pro hub detection to use presence of enabled LIP server on the bridge; should allow RA+ Select also
 //					modified LIP-LEAP device matching to take Area (Room) into account, if present
-//					tempory patch to make 4-button Picos look like 3RS-Button Picos until SmartApp/Device Handlers can be updated
+//					temporary patch to make 4-button Picos look like 3RS-Button Picos until SmartApp/Device Handlers can be updated
 
 const eventEmitter = require('events');
 var net = require('net');
@@ -953,9 +953,11 @@ function Bridge(brix,ip) {
 
 		  self.lipDevices = jsonData.Body.LIPIdList;
 
-		  // hokey patch for 4-button Pico: make it look & act like a 3RL Pico
+		  // hokey patch for 4-button Pico & other odd Pico: make it look & act like a 3RL Pico
 		  self.leapDevices.forEach(function Pico4to3(dev, ix, leapDevs) {
-			if (dev.DeviceType.indexOf('Pico4Button') === 0)
+			if ((dev.DeviceType.indexOf('Pico4Button') === 0) ||
+				(dev.DeviceType == 'Pico2ButtonRaiseLower') ||
+				(dev.DeviceType == 'Pico3Button') )
 			  leapDevs[ix].DeviceType = 'Pico3ButtonRaiseLower';
 		  });
 
