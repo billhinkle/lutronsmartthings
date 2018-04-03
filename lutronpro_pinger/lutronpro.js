@@ -8,6 +8,7 @@
 //					modified LIP-LEAP device matching to take Area (Room) into account, if present
 //					temporary patch to make 4-button Picos look like 3BRL Picos until SmartApp/Device Handlers can be updated
 // rev		1.1.0.6 wjh		temporary patch to make 2BRL Pico look like 3BRL Pico & dupe its Lower button onto a phantom Favorites for Stringify
+// rev		1.1.0.7 wjh		removed throw on sent-to-SmartThings error, now just informational logging (not listening before 1st device discovery)
 
 const eventEmitter = require('events');
 var net = require('net');
@@ -74,7 +75,7 @@ function initalize(ip, cb) {
 			haveCerts = true;
 			callback();
 		} else {
-			console.log('No certs will attempt to generate them')
+			console.log('No certs will attempt to generate them');
 
 			forge.pki.rsa.generateKeyPair(2048, function(error, keypair) {
 			   console.log('keys callback');
@@ -83,7 +84,7 @@ function initalize(ip, cb) {
 			   fs.writeFileSync("privateKey", pem);
 			   keys = keypair;
 			   //getCSR();
-			   startCodeFetch()
+			   startCodeFetch();
 			});
 
 		}
@@ -144,7 +145,7 @@ function getCode() {
 }
 
 function getCSR() {
-	console.log('in get CSR')
+	console.log('in get CSR');
 	var csr = forge.pki.createCertificationRequest();
 
 	// fill the required fields
@@ -267,8 +268,8 @@ ssdp.addUSN('urn:schemas-upnp-org:device:RPi_Lutron_Caseta:1');
 // start the server later, when entirely initialized
 
 process.on('exit', function(){
-      ssdp.stop() // advertise shutting down and stop listening 
-})
+      ssdp.stop(); // advertise shutting down and stop listening 
+});
 
 var testData1 = '{"CommuniqueType":"ReadResponse","Header":'
 var testData2 = '{"MessageBodyType":"OneLIPIdListDefinition","StatusCode":"200 OK","Url":"/server/2/id"},"Body":{"LIPIdList":{"Devices":[{"Name":"Smart Bridge","ID":1,"Buttons":[{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test 2","Number":2},{"Name":"Sonos","Number":3},{"Name":"Button 4","Number":4},{"Name":"Button 5","Number":5},{"Name":"Button 6","Number":6},{"Name":"Button 7","Number":7},{"Name":"Button 8","Number":8},{"Name":"Button 9","Number":9},{"Name":"Button 10","Number":10},{"Name":"Button 11","Number":11},{"Name":"Button 12","Number":12},{"Name":"Button 13","Number":13},{"Name":"Button 14","Number":14},{"Name":"Button 15","Number":15},{"Name":"Button 16","Number":16},{"Name":"Button 17","Number":17},{"Name":"Button 18","Number":18},{"Name":"Button 19","Number":19},{"Name":"Button 20","Number":20},{"Name":"Button 21","Number":21},{"Name":"Button 22","Number":22},{"Name":"Button 23","Number":23},{"Name":"Button 24","Number":24},{"Name":"Button 25","Number":25},{"Name":"Button 26","Number":26},{"Name":"Button 27","Number":27},{"Name":"Button 28","Number":28},{"Name":"Button 29","Number":29},{"Name":"Button 30","Number":30},{"Name":"Button 31","Number":31},{"Name":"Button 32","Number":32},{"Name":"Button 33","Number":33},{"Name":"Button 34","Number":34},{"Name":"Button 35","Number":35},{"Name":"Button 36","Number":36},{"Name":"Button 37","Number":37},{"Name":"Button 38","Number":38},{"Name":"Button 39","Number":39},{"Name":"Button 40","Number":40},{"Name":"Button 41","Number":41},{"Name":"Button 42","Number":42},{"Name":"Button 43","Number":43},{"Name":"Button 44","Number":44},{"Name":"Button 45","Number":45},{"Name":"Button 46","Number":46},{"Name":"Button 47","Number":47},{"Name":"Button 48","Number":48},{"Name":"Button 49","Number":49},{"Name":"Button 50","Number":50},{"Name":"Button 51","Number":51},{"Name":"Button 52","Number":52},{"Name":"Button 53","Number":53},{"Name":"Button 54","Number":54},{"Name":"Button 55","Number":55},{"Name":"Button 56","Number":56},{"Name":"Button 57","Number":57},{"Name":"Button 58","Number":58},{"Name":"Button 59","Number":59},{"Name":"Button 60","Number":60},{"Name":"Button 61","Number":61},{"Name":"Button 62","Number":62},{"Name":"Button 63","Number":63},{"Name":"Button 64","Number":64},{"Name":"Button 65","Number":65},{"Name":"Button 66","Number":66},{"Name":"Button 67","Number":67},{"Name":"Button 68","Number":68},{"Name":"Button 69","Number":69},{"Name":"Button 70","Number":70},{"Name":"Button 71","Number":71},{"Name":"Button 72","Number":72},{"Name":"Button 73","Number":73},{"Name":"Button 74","Number":74},{"Name":"Button 75","Number":75},{"Name":"Button 76","Number":76},{"Name":"Button 77","Number":77},{"Name":"Button 78","Number":78},{"Name":"Button 79","Number":79},{"Name":"Button 80","Number":80},{"Name":"Button 81","Number":81},{"Name":"Button 82","Number":82},{"Name":"Button 83","Number":83},{"Name":"Button 84","Number":84},{"Name":"Button 85","Number":85},{"Name":"Button 86","Number":86},{"Name":"Button 87","Number":87},{"Name":"Button 88","Number":88},{"Name":"Button 89","Number":89},{"Name":"Button 90","Number":90},{"Name":"Button 91","Number":91},{"Name":"Button 92","Number":92},{"Name":"Button 93","Number":93},{"Name":"Button 94","Number":94},{"Name":"Button 95","Number":95},{"Name":"Button 96","Number":96},{"Name":"Button 97","Number":97},{"Name":"Button 98","Number":98},{"Name":"Button 99","Number":99},{"Name":"Button 100","Number":100},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1},{"Name":"Test","Number":1}]},{"Name":"Pico Test","ID":3,"Buttons":[{"Number":2},{"Number":3},{"Number":4},{"Number":5},{"Number":6}]}],"Zones":[{"Name":"Office","ID":2}]}}}'
@@ -364,7 +365,7 @@ function telnetHandler(lcbridgeself, ip, callback) {
 			telnetClient.write('integration\r\n');
 	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
 		  isConnect = true;
-		  console.log("Connected!")
+		  console.log("Connected!");
 	  } else if (data.toString().indexOf('~OUTPUT') !== -1) {
 		  console.log('Device update received\n possibly a manual change');
 
@@ -469,9 +470,9 @@ function telnetHandler(lcbridgeself, ip, callback) {
 			if (message[3] == 3) {
 			  start = new Date().getTime();
 			  timer = setTimeout(function() {
-				console.log("timer ran")
+				console.log("timer ran");
 				interval = setInterval(function() {
-					console.log("interval ran")
+					console.log("interval ran");
 					buttonAction = "held";
 					var myJSONObject = {device: message[1], button: message[2], action: buttonAction };
 					callback(myJSONObject);
@@ -581,9 +582,9 @@ function telnetHandler(lcbridgeself, ip, callback) {
 			telnetClient.write('integration\r\n');
 	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
 		  isConnect = true;
-		  console.log("Connected!")
+		  console.log("Connected!");
 	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
-		  
+
 		  var message = data.toString().split(',');
 		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
 		  //telnetClient.write(output);
@@ -630,18 +631,18 @@ function telnetHandler(lcbridgeself, ip, callback) {
 			telnetClient.write('integration\r\n');
 	  } else if (isConnect == false && data.toString().indexOf('GNET>') !== -1) {
 		  isConnect = true;
-		  console.log("Connected!")
+		  console.log("Connected!");
 	  } else if (data.toString().indexOf('~DEVICE') !== -1) {
-		  
+
 		  var message = data.toString().split(',');
 		  output = "#OUTPUT," + "2" + ",1," + "100" + "\r\n";
 		  //telnetClient.write(output);
 		  if (message[3] == 3) {
 			  start = new Date().getTime();
 			  timer = setTimeout(function() {
-				console.log("timer ran")
+				console.log("timer ran");
 				interval = setInterval(function() {
-					console.log("interval ran")
+					console.log("interval ran");
 					var myJSONObject = {device: message[1], button: message[2], action: "held"};
 					request({
 						url: 'http://' + SMARTTHINGS_IP + ':39500',
@@ -677,7 +678,7 @@ function telnetHandler(lcbridgeself, ip, callback) {
 	});
 	*/
 	telnetClient.on('close', function() {
-		console.log("Disconnected telnet from Pro Bridge")
+		console.log("Disconnected telnet from Pro Bridge");
 	});
 	telnetClient.on('connect', function() {
 		console.log('Connected via telnet to Pro Bridge');
@@ -735,7 +736,7 @@ app.post('/scene', function(req, res) {
 		if (snnameix >= 0) {
 			virtualButton = Number(lutronBridges[brix].scenesList[snnameix].href.replace( /\/virtualbutton\//i, ''));
 		}
-		lutronBridges[brix].sslClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n')
+		lutronBridges[brix].sslClient.write('{"CommuniqueType": "CreateRequest","Header": {"Url": "/virtualbutton/' + virtualButton + '/commandprocessor"},"Body": {"Command": {"CommandType": "PressAndRelease"}}}\n');
 		res.sendStatus(202);
 	} else
 		res.sendStatus(404);
@@ -878,7 +879,7 @@ function setDeviceLevelFromReq(bridgeIX,deviceID,deviceZone,deviceLevel) {
 		} // else no device ID can be determined, fall through to try the non-Pro zone scheme
 	}
 	if (deviceZone) {
-		lutronBridges[bridgeIX].sslClient.write('{"CommuniqueType":"CreateRequest","Header":{"Url":"/zone/' + deviceZone + '/commandprocessor"},"Body":{"Command":{"CommandType":"GoToLevel","Parameter":[{"Type":"Level","Value":' + deviceLevel +'}]}}}\n')
+		lutronBridges[bridgeIX].sslClient.write('{"CommuniqueType":"CreateRequest","Header":{"Url":"/zone/' + deviceZone + '/commandprocessor"},"Body":{"Command":{"CommandType":"GoToLevel","Parameter":[{"Type":"Level","Value":' + deviceLevel +'}]}}}\n');
 		return true;
 	}
 	return false;
@@ -991,7 +992,7 @@ function Bridge(brix,ip) {
 		  });
 
 		  leapLipParser(self.lipDevices, self.leapDevices, function(data) {
-			console.log("The merged data is:\n" + JSON.stringify(data))
+			console.log("The merged data is:\n" + JSON.stringify(data));
 			self.mergedDevices = data;
 		  });
 
@@ -1063,15 +1064,17 @@ function Bridge(brix,ip) {
 						json: true,
 						body: jsonData
 					}, function (error, response, body){
-						if (error)
-							throw(error);
+						if (error) {
+//							throw(error);
+							console.log ('SmartThings hub is not listening at ' + SMARTTHINGS_IP + ':39500');
+  						}
 					}); 
 			}
 		}
 	}
 
 	function initTelnet() {
-		console.log("starting telnet connection")
+		console.log("starting telnet connection");
 		self.telnetClient = new net.Socket();
 		appTelnetClient = self.telnetClient;
 		telnetHandler(self, self.ip, telnetJSONToSmartThings);
@@ -1107,4 +1110,6 @@ exports.startup = function(SB_IP, ST_IP, USER, PW, bMethods, spTime, intTime) {
 		buttonMethods = bMethods;
 		ssdp.start();
 	});
+};
+
 };
