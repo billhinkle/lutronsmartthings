@@ -13,4 +13,4 @@ Same as Nate Schwartz' lutronpro v1.1.0 with:
               modified LIP-LEAP device matching to take Area (Room) into account, if present
               temporary patch to make 4-button Picos look like 3BRL Picos until SmartApp/Device Handlers can be updated
  1.1.0.6 wjh		temporary patch to make 2BRL Pico look like 3BRL Pico & dupe its Lower button onto a phantom Favorites for Stringify
- 
+ 1.1.0.7 wjh  removed throw on sent-to-SmartThings error, now just informational logging (not listening before 1st device discovery)
